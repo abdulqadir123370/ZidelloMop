@@ -264,7 +264,7 @@
       <div class="sub">PACKING DEPARTMENT</div>
     </div>
     <nav class="rail-nav" id="railNav"></nav>
-    <div class="rail-foot">Data stored locally in this browser</div>
+    <div class="rail-foot">Synced live \u00b7 shared cloud data</div>
   </aside>
 
   <div class="main">
@@ -279,18 +279,63 @@
 <div class="modal-root hidden" id="modalRoot"></div>
 <div class="toast-root" id="toastRoot"></div>
 
-<script>
+<script type="module">
 /* ============================================================
-   MOP PACKING MODULE — v2.0
+   MOP PACKING MODULE — v3.0 (Cloud edition)
    Rebuilt to follow the exact written procedure:
    Step 1  Refill stock IN          (challan)
    Step 2  Stock -> Packing         (challan) -> complete cartons + loose pieces
    Step 2.5  Loose pieces -> Refill (challan)
    Step 3  Dispatch complete cartons (challan) -> Dispatch report
    Ledgers: Refill, Finished Goods, Loose Pieces
+
+   Data now lives in Firebase Firestore instead of localStorage, so every
+   device/browser sees the same shared, real-time data. All stock-changing
+   actions run inside Firestore transactions (read-then-write, atomic) so
+   two people editing at the same moment can't silently overwrite or
+   corrupt each other's changes.
    ============================================================ */
 
-const STORAGE_KEY = 'mopPackingData_v2';
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/12.15.0/firebase-app.js';
+import { getAuth, signInAnonymously, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/12.15.0/firebase-auth.js';
+import {
+  getFirestore, collection, doc, onSnapshot, runTransaction,
+  setDoc, deleteDoc, getDocs, writeBatch, enableIndexedDbPersistence
+} from 'https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js';
+
+/* ============================================================
+   FIREBASE SETUP
+   1. Go to https://console.firebase.google.com -> Add project
+   2. In the project: Build > Firestore Database > Create database
+      (start in production mode, pick a nearby region)
+   3. Build > Authentication > Sign-in method > enable "Anonymous"
+   4. Project settings (gear icon) > General > scroll to "Your apps"
+      > Add app > Web (</>) > register it > copy the firebaseConfig
+      object it gives you and paste it below, replacing the placeholder.
+   5. In Firestore > Rules, paste:
+        rules_version = '2';
+        service cloud.firestore {
+          match /databases/{database}/documents {
+            match /{document=**} {
+              allow read, write: if request.auth != null;
+            }
+          }
+        }
+      This means: anyone who opens this page (and is auto signed-in
+      anonymously) can read/write. That's fine for a small internal
+      team tool reached via an unlisted URL, but it is NOT a real
+      access-control boundary -- anyone with the link and the URL
+      could read or change the data. If that's ever a concern, this
+      needs proper accounts + rules keyed to specific user IDs instead.
+   ============================================================ */
+const firebaseConfig = {
+  apiKey: "AIzaSyAk0hWoUTBnbGDhZYf77KEZVwGZAAzp_Tk",
+  authDomain: "zidellomop.firebaseapp.com",
+  projectId: "zidellomop",
+  storageBucket: "zidellomop.firebasestorage.app",
+  messagingSenderId: "618376962439",
+  appId: "1:618376962439:web:b06fee2187c347cb487322"
+};
 
 const NAV = [
   {id:'dashboard', label:'Dashboard', short:'Board', icon:'grid'},
@@ -331,8 +376,10 @@ function defaultState(){
 }
 
 const App = {
-  state: null,
+  state: defaultState(),
   ui:{
+    ready:false,
+    connectionError:null,
     tab:'dashboard',
     refillMode:'list', // 'list' | 'new' | 'view'
     refillSheetForm:null,
@@ -344,24 +391,52 @@ const App = {
   actions:{}
 };
 
-/* ---------------- persistence ---------------- */
-function load(){
-  try{
-    const raw = localStorage.getItem(STORAGE_KEY);
-    App.state = raw ? JSON.parse(raw) : defaultState();
-    if(!App.state.meta) App.state.meta = defaultState().meta;
-    if(!App.state.meta.companyName) App.state.meta.companyName = 'Royal Plastic';
-    if(!App.state.stock) App.state.stock = {};
-    if(!App.state.transactions) App.state.transactions = [];
-    if(!App.state.ledger) App.state.ledger = [];
-    if(!App.state.materialInSheets) App.state.materialInSheets = [];
-  }catch(e){
-    console.error('Failed to load data, starting fresh.', e);
-    App.state = defaultState();
+/* ---------------- Firebase init + real-time listeners ---------------- */
+const firebaseApp = initializeApp(firebaseConfig);
+const auth = getAuth(firebaseApp);
+const db = getFirestore(firebaseApp);
+try{ enableIndexedDbPersistence(db); }catch(e){ /* multiple tabs open, or unsupported browser -- fine, just skip offline cache */ }
+
+function attachListeners(){
+  const flags = {products:false, stock:false, transactions:false, materialInSheets:false, ledger:false, meta:false};
+  function checkReady(){
+    if(!App.ui.ready && Object.keys(flags).every(function(k){return flags[k];})){
+      App.ui.ready = true;
+    }
+    render();
   }
-}
-function save(){
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(App.state));
+
+  onSnapshot(collection(db,'products'), function(snap){
+    App.state.products = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
+    flags.products = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(collection(db,'stock'), function(snap){
+    const s = {};
+    snap.docs.forEach(function(d){ s[d.id] = d.data(); });
+    App.state.stock = s;
+    flags.stock = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(collection(db,'transactions'), function(snap){
+    App.state.transactions = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
+    flags.transactions = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(collection(db,'materialInSheets'), function(snap){
+    App.state.materialInSheets = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
+    flags.materialInSheets = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(collection(db,'ledger'), function(snap){
+    App.state.ledger = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
+    flags.ledger = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(doc(db,'meta','settings'), function(snap){
+    App.state.meta = Object.assign({currentUser:'Operator', editWindowHours:24, companyName:'Royal Plastic'}, snap.exists() ? snap.data() : {});
+    flags.meta = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
 }
 
 /* ---------------- helpers ---------------- */
@@ -398,8 +473,10 @@ function productCartonSize(id){
   return p ? (p.cartonSize||1) : 1;
 }
 function stockFor(productId){
-  if(!App.state.stock[productId]) App.state.stock[productId] = {refill:0, finished:0, loose:0};
-  return App.state.stock[productId];
+  // Read-only: App.state.stock is a live cache fed by a Firestore listener,
+  // so this must never write into it -- just return a safe default when
+  // a stock doc hasn't been created yet (or hasn't synced down).
+  return App.state.stock[productId] || {refill:0, finished:0, loose:0};
 }
 function findSheetByTxnId(txnId){
   return App.state.materialInSheets.find(function(s){return s.txnIds && s.txnIds.indexOf(txnId)!==-1;});
@@ -480,30 +557,24 @@ function lineValid(line){
   return line.productId && Number(line.pcsPerBag)>0 && Number(line.bags)>0;
 }
 
-/* ---------------- transactions & ledger ---------------- */
-function makeTxn(type, productId, challanNo, note, extra){
-  const txn = Object.assign({
-    id: uid('txn'), type: type, productId: productId, challanNo: challanNo, note: note||'',
-    ts: Date.now(), user: App.state.meta.currentUser||'Operator',
-    editableUntil: Date.now() + (Number(App.state.meta.editWindowHours||24) * 3600 * 1000),
+/* ---------------- pure data builders (no side effects -- used inside Firestore transactions) ---------------- */
+function editWindowMs(){
+  return Number(App.state.meta.editWindowHours || 24) * 3600 * 1000;
+}
+function buildTxnData(type, productId, challanNo, note, ts, extra){
+  return Object.assign({
+    type: type, productId: productId, challanNo: challanNo, note: note||'',
+    ts: ts, user: App.state.meta.currentUser||'Operator',
+    editableUntil: Date.now() + editWindowMs(),
     voided:false
   }, extra||{});
-  App.state.transactions.push(txn);
-  return txn;
 }
-function pushLedger(txn, productId, area, delta, balanceAfter, reason){
-  App.state.ledger.push({
-    id: uid('lg'), txnId: txn.id, ts: txn.ts, productId: productId, area: area,
+function buildLedgerData(txnId, ts, productId, area, delta, balanceAfter, reason, challanNo, user){
+  return {
+    txnId: txnId, ts: ts, productId: productId, area: area,
     delta: delta, balanceAfter: balanceAfter, reason: reason,
-    challanNo: txn.challanNo, user: txn.user
-  });
-}
-function creditRefill(productId, qty, challanNo, ts, note){
-  const st = stockFor(productId);
-  st.refill += qty;
-  const txn = makeTxn('refill_in', productId, challanNo, note, {qty: qty, ts: ts});
-  pushLedger(txn, productId, 'refill', qty, st.refill, 'Refill stock IN');
-  return txn;
+    challanNo: challanNo, user: user
+  };
 }
 
 /* ---------------- modal ---------------- */
@@ -553,6 +624,18 @@ function render(){
 
   renderNav();
   const view = document.getElementById('view');
+
+  if(App.ui.connectionError){
+    view.innerHTML = '<div class="empty"><div class="disp">Can\'t connect to the cloud</div>' +
+      '<p>'+escapeHtml(App.ui.connectionError)+'</p>' +
+      '<p style="margin-top:6px;">Check the Firebase config in Settings &gt; Data, and that Firestore + Anonymous sign-in are enabled in the Firebase console.</p></div>';
+    return;
+  }
+  if(!App.ui.ready){
+    view.innerHTML = '<div class="empty"><div class="disp">Connecting to cloud\u2026</div><p>Loading shared factory data.</p></div>';
+    return;
+  }
+
   const fn = {
     dashboard: viewDashboard,
     refill: viewRefill,
@@ -976,21 +1059,27 @@ function viewSettings(){
 App.actions.nav = function(tab){ App.ui.tab = tab; render(); };
 
 /* ---- products ---- */
-App.actions.addProduct = function(){
+App.actions.addProduct = async function(){
   const name = document.getElementById('newProdName').value.trim();
   const cartonSize = Number(document.getElementById('newProdCarton').value);
   const pcsPerBag = Number(document.getElementById('newProdPcsBag').value) || null;
   if(!name) return toast('Enter a product name', 'err');
   if(!cartonSize || cartonSize<1) return toast('Enter a valid carton size (pieces per carton)', 'err');
-  App.state.products.push({id: uid('prod'), name: name, cartonSize: cartonSize, pcsPerBag: pcsPerBag, createdAt: Date.now()});
-  save(); render(); toast('Product added', 'ok');
+  try{
+    const ref = doc(collection(db,'products'));
+    await setDoc(ref, {name: name, cartonSize: cartonSize, pcsPerBag: pcsPerBag, createdAt: Date.now()});
+    await setDoc(doc(db,'stock',ref.id), {refill:0, finished:0, loose:0});
+    toast('Product added', 'ok');
+  }catch(e){ toast('Failed to add product: '+e.message, 'err'); }
 };
-App.actions.deleteProduct = function(id){
+App.actions.deleteProduct = async function(id){
   const st = App.state.stock[id];
   const used = App.state.transactions.some(function(t){return t.productId===id;}) || (st && (st.refill||st.finished||st.loose));
   if(used) return toast("Can't delete \u2014 this product has activity", 'err');
-  App.state.products = App.state.products.filter(function(p){return p.id!==id;});
-  save(); render();
+  try{
+    await deleteDoc(doc(db,'products',id));
+    await deleteDoc(doc(db,'stock',id));
+  }catch(e){ toast('Failed to delete product: '+e.message, 'err'); }
 };
 
 /* ---- Step 1: Refill IN (multi-line material-in sheet) ---- */
@@ -1025,7 +1114,7 @@ App.actions.refillRemoveLine = function(i){
   if(!f.lines.length) f.lines.push(newEmptyLine());
   render();
 };
-App.actions.refillSubmitSheet = function(){
+App.actions.refillSubmitSheet = async function(){
   const f = App.ui.refillSheetForm;
   const challanNo = (f.challanNo||'').trim();
   if(!f.date) return toast('Select a date', 'err');
@@ -1035,74 +1124,143 @@ App.actions.refillSubmitSheet = function(){
   if(challanAlreadyUsed('refill_in', challanNo) && !confirm('Challan '+challanNo+' was already used for a Refill IN entry. Continue anyway?')) return;
 
   const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
-  const txnIds = [];
+
+  // Flatten lines into individual per-product credits (a mix line becomes two credits)
+  const credits = [];
   validLines.forEach(function(line){
     if(line.mode==='mix'){
       const qtyA = (Number(line.qtyA)||0) * (Number(line.bags)||0);
       const qtyB = (Number(line.qtyB)||0) * (Number(line.bags)||0);
-      if(qtyA>0){ const t1 = creditRefill(line.productId, qtyA, challanNo, ts, 'Mix bag with '+productName(line.productIdB)); txnIds.push(t1.id); }
-      if(qtyB>0){ const t2 = creditRefill(line.productIdB, qtyB, challanNo, ts, 'Mix bag with '+productName(line.productId)); txnIds.push(t2.id); }
+      if(qtyA>0) credits.push({productId: line.productId, qty: qtyA, note: 'Mix bag with '+productName(line.productIdB)});
+      if(qtyB>0) credits.push({productId: line.productIdB, qty: qtyB, note: 'Mix bag with '+productName(line.productId)});
     } else {
       const qty = (Number(line.pcsPerBag)||0) * (Number(line.bags)||0);
-      const t = creditRefill(line.productId, qty, challanNo, ts, '');
-      txnIds.push(t.id);
+      credits.push({productId: line.productId, qty: qty, note: ''});
     }
   });
 
-  const sheet = {
-    id: uid('sheet'), date: f.date, challanNo: challanNo, sheetTitle: f.sheetTitle||'',
-    receivedBy: f.receivedBy||'', verifiedBy: f.verifiedBy||'',
-    lines: validLines, txnIds: txnIds,
-    voided:false, createdAt: Date.now(),
-    editableUntil: Date.now() + (Number(App.state.meta.editWindowHours||24) * 3600 * 1000)
-  };
-  App.state.materialInSheets.push(sheet);
-  if(f.sheetTitle) App.state.meta.lastSheetTitle = f.sheetTitle;
+  const uniqueProductIds = credits.reduce(function(arr,c){ if(arr.indexOf(c.productId)===-1) arr.push(c.productId); return arr; }, []);
+  const sheetRef = doc(collection(db,'materialInSheets'));
+  const txnRefs = credits.map(function(){ return doc(collection(db,'transactions')); });
+  const ledgerRefs = credits.map(function(){ return doc(collection(db,'ledger')); });
+  const stockRefs = {};
+  uniqueProductIds.forEach(function(pid){ stockRefs[pid] = doc(db,'stock',pid); });
 
-  save();
-  App.ui.viewingSheetId = sheet.id;
-  App.ui.refillMode = 'view';
-  toast('Sheet saved \u2014 stock updated', 'ok');
-  render();
+  try{
+    await runTransaction(db, async function(transaction){
+      // READS first (Firestore transactions require all gets before any writes)
+      const stockData = {};
+      for(const pid of uniqueProductIds){
+        const snap = await transaction.get(stockRefs[pid]);
+        stockData[pid] = snap.exists() ? snap.data() : {refill:0, finished:0, loose:0};
+      }
+
+      // Apply credits in order, tracking a running balance per product so
+      // each ledger line's balanceAfter is correct even when two lines on
+      // this sheet touch the same product.
+      const running = {};
+      uniqueProductIds.forEach(function(pid){ running[pid] = stockData[pid].refill; });
+
+      const txnIds = [];
+      credits.forEach(function(c, i){
+        running[c.productId] += c.qty;
+        const txnData = buildTxnData('refill_in', c.productId, challanNo, c.note, ts, {qty: c.qty});
+        transaction.set(txnRefs[i], txnData);
+        txnIds.push(txnRefs[i].id);
+        transaction.set(ledgerRefs[i], buildLedgerData(txnRefs[i].id, ts, c.productId, 'refill', c.qty, running[c.productId], 'Refill stock IN', challanNo, txnData.user));
+      });
+
+      uniqueProductIds.forEach(function(pid){
+        transaction.set(stockRefs[pid], Object.assign({}, stockData[pid], {refill: running[pid]}));
+      });
+
+      transaction.set(sheetRef, {
+        date: f.date, challanNo: challanNo, sheetTitle: f.sheetTitle||'',
+        receivedBy: f.receivedBy||'', verifiedBy: f.verifiedBy||'',
+        lines: validLines, txnIds: txnIds,
+        voided:false, createdAt: Date.now(),
+        editableUntil: Date.now() + editWindowMs()
+      });
+    });
+
+    if(f.sheetTitle) setDoc(doc(db,'meta','settings'), {lastSheetTitle: f.sheetTitle}, {merge:true}).catch(function(){});
+
+    App.ui.viewingSheetId = sheetRef.id;
+    App.ui.refillMode = 'view';
+    toast('Sheet saved \u2014 stock updated', 'ok');
+    render();
+  }catch(e){
+    toast('Failed to save sheet: '+e.message, 'err');
+  }
 };
 App.actions.refillViewSheet = function(id){ App.ui.viewingSheetId = id; App.ui.refillMode = 'view'; render(); };
 App.actions.refillBackToList = function(){ App.ui.refillMode = 'list'; render(); };
 App.actions.refillPrintSheet = function(){ window.print(); };
-App.actions.refillVoidSheet = function(sheetId){
-  const sheet = App.state.materialInSheets.find(function(s){return s.id===sheetId;});
-  if(!sheet) return;
-  if(sheet.voided) return toast('Already voided', 'err');
-  if(Date.now() > sheet.editableUntil) return toast('Void window has passed for this sheet', 'err');
+App.actions.refillVoidSheet = async function(sheetId){
+  const sheetRef = doc(db,'materialInSheets',sheetId);
+  const cached = App.state.materialInSheets.find(function(s){return s.id===sheetId;});
+  if(!cached) return;
+  if(cached.voided) return toast('Already voided', 'err');
+  if(Date.now() > cached.editableUntil) return toast('Void window has passed for this sheet', 'err');
+  if(!confirm('Void this entire material-in sheet (Challan '+cached.challanNo+')? This reverses all line credit(s).')) return;
 
-  const txns = sheet.txnIds.map(function(id){return App.state.transactions.find(function(t){return t.id===id;});}).filter(Boolean);
-  const projected = {};
-  for(let k=0;k<txns.length;k++){
-    const txn = txns[k];
-    if(txn.voided) continue;
-    const cur = projected[txn.productId] !== undefined ? projected[txn.productId] : stockFor(txn.productId).refill;
-    const next = cur - txn.qty;
-    if(next < 0) return toast('Cannot void \u2014 stock from "'+productName(txn.productId)+'" in this sheet has already been used', 'err');
-    projected[txn.productId] = next;
+  try{
+    await runTransaction(db, async function(transaction){
+      const sheetSnap = await transaction.get(sheetRef);
+      if(!sheetSnap.exists()) throw new Error('Sheet not found');
+      const sheet = sheetSnap.data();
+      if(sheet.voided) throw new Error('Already voided');
+      if(Date.now() > sheet.editableUntil) throw new Error('Void window has passed for this sheet');
+
+      const txnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
+      const txnSnaps = [];
+      for(const ref of txnRefs){ txnSnaps.push(await transaction.get(ref)); }
+
+      const uniqueProductIds = [];
+      txnSnaps.forEach(function(s){ if(s.exists()){ const pid=s.data().productId; if(uniqueProductIds.indexOf(pid)===-1) uniqueProductIds.push(pid); } });
+      const stockRefs = {}; const stockData = {};
+      for(const pid of uniqueProductIds){
+        stockRefs[pid] = doc(db,'stock',pid);
+        const snap = await transaction.get(stockRefs[pid]);
+        stockData[pid] = snap.exists() ? snap.data() : {refill:0, finished:0, loose:0};
+      }
+
+      // Guard + compute: walk every txn once, tracking the running balance
+      // per product step-by-step (so each ledger line's balanceAfter is
+      // correct even if two lines in this sheet touch the same product).
+      // Throwing here aborts before any writes are issued -- safe.
+      const running = {};
+      uniqueProductIds.forEach(function(pid){ running[pid] = stockData[pid].refill; });
+      const reversalSteps = []; // {txnRef, ledgerRef, productId, qty, balanceAfter}
+      txnSnaps.forEach(function(s, i){
+        if(!s.exists()) return;
+        const t = s.data();
+        if(t.voided) return;
+        running[t.productId] -= t.qty;
+        if(running[t.productId] < 0) throw new Error('Cannot void \u2014 stock from "'+productName(t.productId)+'" in this sheet has already been used');
+        reversalSteps.push({txnRef: txnRefs[i], productId: t.productId, qty: t.qty, balanceAfter: running[t.productId]});
+      });
+
+      // All clear -- write the reversal.
+      reversalSteps.forEach(function(step){
+        transaction.update(step.txnRef, {voided:true});
+        const ledgerRef = doc(collection(db,'ledger'));
+        transaction.set(ledgerRef, buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'refill', -step.qty, step.balanceAfter, 'Void \u2014 Sheet Challan '+sheet.challanNo, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+      });
+      uniqueProductIds.forEach(function(pid){
+        transaction.set(stockRefs[pid], Object.assign({}, stockData[pid], {refill: running[pid]}));
+      });
+      transaction.update(sheetRef, {voided:true});
+    });
+    toast('Sheet voided', 'ok');
+  }catch(e){
+    toast(e.message || 'Failed to void sheet', 'err');
   }
-
-  if(!confirm('Void this entire material-in sheet (Challan '+sheet.challanNo+')? This reverses all '+txns.length+' line credit(s).')) return;
-
-  txns.forEach(function(txn){
-    if(txn.voided) return;
-    const st = stockFor(txn.productId);
-    st.refill -= txn.qty;
-    pushLedger(txn, txn.productId, 'refill', -txn.qty, st.refill, 'Void \u2014 Sheet Challan '+sheet.challanNo);
-    txn.voided = true;
-  });
-  sheet.voided = true;
-  save();
-  toast('Sheet voided', 'ok');
-  render();
 };
 
 /* ---- Step 2: Pack ---- */
 App.actions.packSetField = function(key, val){ App.ui.pack[key] = val; render(); };
-App.actions.packSubmit = function(){
+App.actions.packSubmit = async function(){
   const d = App.ui.pack;
   const product = App.state.products.find(function(p){return p.id===d.productId;});
   const qty = Number(d.qty);
@@ -1110,28 +1268,38 @@ App.actions.packSubmit = function(){
   if(!product) return toast('Select a product', 'err');
   if(!qty || qty<=0) return toast('Enter a valid quantity to pack', 'err');
   if(!challanNo) return toast('Enter the packing challan number', 'err');
-  const st = stockFor(product.id);
-  if(qty > st.refill) return toast('Not enough refill stock', 'err');
   if(challanAlreadyUsed('pack', challanNo) && !confirm('Challan '+challanNo+' was already used for a Pack entry. Continue anyway?')) return;
 
   const cartonSize = product.cartonSize||1;
   const cartons = Math.floor(qty / cartonSize);
   const loose = qty % cartonSize;
+  const stockRef = doc(db,'stock',product.id);
+  const txnRef = doc(collection(db,'transactions'));
 
-  st.refill -= qty;
-  st.finished += cartons;
-  st.loose += loose;
+  try{
+    await runTransaction(db, async function(transaction){
+      const snap = await transaction.get(stockRef);
+      const cur = snap.exists() ? snap.data() : {refill:0, finished:0, loose:0};
+      if(qty > cur.refill) throw new Error('Not enough refill stock');
 
-  const txn = makeTxn('pack', product.id, challanNo, d.note, {qtyTaken: qty, cartonsProduced: cartons, looseProduced: loose});
-  pushLedger(txn, product.id, 'refill', -qty, st.refill, 'Sent to packing');
-  if(cartons>0) pushLedger(txn, product.id, 'finished', cartons, st.finished, 'Packed \u2014 complete cartons');
-  if(loose>0) pushLedger(txn, product.id, 'loose', loose, st.loose, 'Packed \u2014 loose pieces');
+      const next = {refill: cur.refill-qty, finished: cur.finished+cartons, loose: cur.loose+loose};
+      const now = Date.now();
+      const txnData = buildTxnData('pack', product.id, challanNo, d.note, now, {qtyTaken:qty, cartonsProduced:cartons, looseProduced:loose});
 
-  save();
-  App.ui.pack = {productId:'', qty:'', challanNo:'', note:''};
-  showStamp('Packed \u00b7 '+challanNo);
-  toast('Packed: '+cartons+' carton(s), '+loose+' loose piece(s)', 'ok');
-  render();
+      transaction.set(stockRef, next);
+      transaction.set(txnRef, txnData);
+      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, product.id, 'refill', -qty, next.refill, 'Sent to packing', challanNo, txnData.user));
+      if(cartons>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, product.id, 'finished', cartons, next.finished, 'Packed \u2014 complete cartons', challanNo, txnData.user));
+      if(loose>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, product.id, 'loose', loose, next.loose, 'Packed \u2014 loose pieces', challanNo, txnData.user));
+    });
+
+    App.ui.pack = {productId:'', qty:'', challanNo:'', note:''};
+    showStamp('Packed \u00b7 '+challanNo);
+    toast('Packed: '+cartons+' carton(s), '+loose+' loose piece(s)', 'ok');
+    render();
+  }catch(e){
+    toast(e.message || 'Pack failed', 'err');
+  }
 };
 
 /* ---- Step 2.5: Loose -> Refill ---- */
@@ -1157,7 +1325,7 @@ App.actions.looseModalRefresh = function(productId){
   if(!productId){ hint.innerHTML=''; return; }
   hint.innerHTML = '<div class="balance-hint">Loose balance: <strong style="margin-left:4px;">'+stockFor(productId).loose+' pcs</strong></div>';
 };
-App.actions.looseReturnSubmit = function(){
+App.actions.looseReturnSubmit = async function(){
   const productId = document.getElementById('f_product').value;
   const qty = Number(document.getElementById('f_qty').value);
   const challanNo = document.getElementById('f_challan').value.trim();
@@ -1165,16 +1333,31 @@ App.actions.looseReturnSubmit = function(){
   if(!productId) return toast('Select a product', 'err');
   if(!qty || qty<=0) return toast('Enter a valid quantity', 'err');
   if(!challanNo) return toast('Enter the challan number', 'err');
-  const st = stockFor(productId);
-  if(qty > st.loose) return toast('Not enough loose pieces for that product', 'err');
   if(challanAlreadyUsed('loose_return', challanNo) && !confirm('Challan '+challanNo+' was already used for a Loose Return entry. Continue anyway?')) return;
 
-  st.loose -= qty;
-  st.refill += qty;
-  const txn = makeTxn('loose_return', productId, challanNo, note, {qty: qty});
-  pushLedger(txn, productId, 'loose', -qty, st.loose, 'Returned to refill stock');
-  pushLedger(txn, productId, 'refill', qty, st.refill, 'Received from loose-piece return');
-  save(); closeModal(); toast('Loose pieces returned to refill', 'ok'); render();
+  const stockRef = doc(db,'stock',productId);
+  const txnRef = doc(collection(db,'transactions'));
+
+  try{
+    await runTransaction(db, async function(transaction){
+      const snap = await transaction.get(stockRef);
+      const cur = snap.exists() ? snap.data() : {refill:0, finished:0, loose:0};
+      if(qty > cur.loose) throw new Error('Not enough loose pieces for that product');
+
+      const next = {refill: cur.refill+qty, finished: cur.finished, loose: cur.loose-qty};
+      const now = Date.now();
+      const txnData = buildTxnData('loose_return', productId, challanNo, note, now, {qty: qty});
+
+      transaction.set(stockRef, next);
+      transaction.set(txnRef, txnData);
+      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, productId, 'loose', -qty, next.loose, 'Returned to refill stock', challanNo, txnData.user));
+      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, productId, 'refill', qty, next.refill, 'Received from loose-piece return', challanNo, txnData.user));
+    });
+    closeModal();
+    toast('Loose pieces returned to refill', 'ok');
+  }catch(e){
+    toast(e.message || 'Failed to return loose pieces', 'err');
+  }
 };
 
 /* ---- Step 3: Dispatch ---- */
@@ -1199,7 +1382,7 @@ App.actions.dispatchModalRefresh = function(productId){
   if(!productId){ hint.innerHTML=''; return; }
   hint.innerHTML = '<div class="balance-hint">Finished goods: <strong style="margin-left:4px;">'+stockFor(productId).finished+' cartons</strong></div>';
 };
-App.actions.dispatchSubmit = function(){
+App.actions.dispatchSubmit = async function(){
   const productId = document.getElementById('f_product').value;
   const qty = Number(document.getElementById('f_qty').value);
   const challanNo = document.getElementById('f_challan').value.trim();
@@ -1208,70 +1391,94 @@ App.actions.dispatchSubmit = function(){
   if(!productId) return toast('Select a product', 'err');
   if(!qty || qty<=0) return toast('Enter a valid quantity', 'err');
   if(!challanNo) return toast('Enter the challan number', 'err');
-  const st = stockFor(productId);
-  if(qty > st.finished) return toast('Not enough finished cartons for that product', 'err');
   if(challanAlreadyUsed('dispatch', challanNo) && !confirm('Challan '+challanNo+' was already used for a Dispatch entry. Continue anyway?')) return;
 
-  st.finished -= qty;
-  const txn = makeTxn('dispatch', productId, challanNo, note, {qty: qty, destination: destination});
-  pushLedger(txn, productId, 'finished', -qty, st.finished, 'Dispatched');
-  save(); closeModal();
-  showStamp('Dispatched \u00b7 '+challanNo);
-  toast('Dispatched '+qty+' carton(s)', 'ok'); render();
+  const stockRef = doc(db,'stock',productId);
+  const txnRef = doc(collection(db,'transactions'));
+
+  try{
+    await runTransaction(db, async function(transaction){
+      const snap = await transaction.get(stockRef);
+      const cur = snap.exists() ? snap.data() : {refill:0, finished:0, loose:0};
+      if(qty > cur.finished) throw new Error('Not enough finished cartons for that product');
+
+      const next = Object.assign({}, cur, {finished: cur.finished-qty});
+      const now = Date.now();
+      const txnData = buildTxnData('dispatch', productId, challanNo, note, now, {qty: qty, destination: destination});
+
+      transaction.set(stockRef, next);
+      transaction.set(txnRef, txnData);
+      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, productId, 'finished', -qty, next.finished, 'Dispatched', challanNo, txnData.user));
+    });
+    closeModal();
+    showStamp('Dispatched \u00b7 '+challanNo);
+    toast('Dispatched '+qty+' carton(s)', 'ok');
+  }catch(e){
+    toast(e.message || 'Dispatch failed', 'err');
+  }
 };
 
 /* ---- void (reverses any transaction type) ---- */
-App.actions.voidTxn = function(txnId){
-  const txn = App.state.transactions.find(function(t){return t.id===txnId;});
-  if(!txn) return;
-  if(txn.voided) return toast('Already voided', 'err');
-  if(Date.now() > txn.editableUntil) return toast('Void window has passed for this transaction', 'err');
-  if(txn.type==='refill_in'){
-    const sheet = findSheetByTxnId(txn.id);
+App.actions.voidTxn = async function(txnId){
+  const cached = App.state.transactions.find(function(t){return t.id===txnId;});
+  if(!cached) return;
+  if(cached.voided) return toast('Already voided', 'err');
+  if(Date.now() > cached.editableUntil) return toast('Void window has passed for this transaction', 'err');
+  if(cached.type==='refill_in'){
+    const sheet = findSheetByTxnId(cached.id);
     if(sheet) return App.actions.refillVoidSheet(sheet.id);
   }
+  if(!confirm('Void this '+TXN_LABELS[cached.type]+' entry (Challan '+cached.challanNo+')? This reverses its stock movement.')) return;
 
-  const st = stockFor(txn.productId);
+  const txnRef = doc(db,'transactions',txnId);
+  const stockRef = doc(db,'stock',cached.productId);
 
-  // Guard: block the void if reversing it would drive a balance negative,
-  // i.e. this batch's output has already been consumed downstream
-  // (packed cartons already dispatched, loose pieces already returned, etc.)
-  if(txn.type==='refill_in'){
-    if(st.refill - txn.qty < 0) return toast('Cannot void \u2014 this refill stock has already been used', 'err');
-  } else if(txn.type==='pack'){
-    if(st.finished - txn.cartonsProduced < 0) return toast('Cannot void \u2014 cartons from this run have already been dispatched', 'err');
-    if(st.loose - txn.looseProduced < 0) return toast('Cannot void \u2014 loose pieces from this run have already been returned', 'err');
-  } else if(txn.type==='loose_return'){
-    if(st.refill - txn.qty < 0) return toast('Cannot void \u2014 this refill stock has already been used', 'err');
+  try{
+    await runTransaction(db, async function(transaction){
+      const txnSnap = await transaction.get(txnRef);
+      if(!txnSnap.exists()) throw new Error('Transaction not found');
+      const txn = txnSnap.data();
+      if(txn.voided) throw new Error('Already voided');
+      if(Date.now() > txn.editableUntil) throw new Error('Void window has passed for this transaction');
+
+      const stockSnap = await transaction.get(stockRef);
+      const cur = stockSnap.exists() ? stockSnap.data() : {refill:0, finished:0, loose:0};
+      const reason = 'Void \u2014 Challan '+txn.challanNo;
+      const now = Date.now();
+      const user = App.state.meta.currentUser||'Operator';
+      let next = Object.assign({}, cur);
+      const ledgerWrites = [];
+
+      // Guard: block the void if reversing it would drive a balance negative
+      // -- i.e. this batch's output has already been consumed downstream.
+      if(txn.type==='pack'){
+        if(cur.finished - txn.cartonsProduced < 0) throw new Error('Cannot void \u2014 cartons from this run have already been dispatched');
+        if(cur.loose - txn.looseProduced < 0) throw new Error('Cannot void \u2014 loose pieces from this run have already been returned');
+        next.refill = cur.refill + txn.qtyTaken;
+        next.finished = cur.finished - txn.cartonsProduced;
+        next.loose = cur.loose - txn.looseProduced;
+        ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'refill', txn.qtyTaken, next.refill, reason, txn.challanNo, user));
+        if(txn.cartonsProduced>0) ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'finished', -txn.cartonsProduced, next.finished, reason, txn.challanNo, user));
+        if(txn.looseProduced>0) ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'loose', -txn.looseProduced, next.loose, reason, txn.challanNo, user));
+      } else if(txn.type==='loose_return'){
+        if(cur.refill - txn.qty < 0) throw new Error('Cannot void \u2014 this refill stock has already been used');
+        next.loose = cur.loose + txn.qty;
+        next.refill = cur.refill - txn.qty;
+        ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'loose', txn.qty, next.loose, reason, txn.challanNo, user));
+        ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'refill', -txn.qty, next.refill, reason, txn.challanNo, user));
+      } else if(txn.type==='dispatch'){
+        next.finished = cur.finished + txn.qty;
+        ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'finished', txn.qty, next.finished, reason, txn.challanNo, user));
+      }
+
+      transaction.set(stockRef, next);
+      transaction.update(txnRef, {voided:true});
+      ledgerWrites.forEach(function(data){ transaction.set(doc(collection(db,'ledger')), data); });
+    });
+    toast('Voided', 'ok');
+  }catch(e){
+    toast(e.message || 'Failed to void', 'err');
   }
-  /* dispatch void only ever adds back to finished goods, so it's always safe */
-
-  if(!confirm('Void this '+TXN_LABELS[txn.type]+' entry (Challan '+txn.challanNo+')? This reverses its stock movement.')) return;
-
-  const reason = 'Void \u2014 Challan '+txn.challanNo;
-
-  if(txn.type==='refill_in'){
-    st.refill -= txn.qty;
-    pushLedger(txn, txn.productId, 'refill', -txn.qty, st.refill, reason);
-  } else if(txn.type==='pack'){
-    st.refill += txn.qtyTaken;
-    st.finished -= txn.cartonsProduced;
-    st.loose -= txn.looseProduced;
-    pushLedger(txn, txn.productId, 'refill', txn.qtyTaken, st.refill, reason);
-    if(txn.cartonsProduced>0) pushLedger(txn, txn.productId, 'finished', -txn.cartonsProduced, st.finished, reason);
-    if(txn.looseProduced>0) pushLedger(txn, txn.productId, 'loose', -txn.looseProduced, st.loose, reason);
-  } else if(txn.type==='loose_return'){
-    st.loose += txn.qty;
-    st.refill -= txn.qty;
-    pushLedger(txn, txn.productId, 'loose', txn.qty, st.loose, reason);
-    pushLedger(txn, txn.productId, 'refill', -txn.qty, st.refill, reason);
-  } else if(txn.type==='dispatch'){
-    st.finished += txn.qty;
-    pushLedger(txn, txn.productId, 'finished', txn.qty, st.finished, reason);
-  }
-
-  txn.voided = true;
-  save(); toast('Voided', 'ok'); render();
 };
 
 /* ---- ledger / report filters & export ---- */
@@ -1306,9 +1513,9 @@ App.actions.exportDispatchCSV = function(){
 };
 
 /* ---- settings ---- */
-App.actions.setUserName = function(val){ App.state.meta.currentUser = val.trim() || 'Operator'; save(); renderNav(); };
-App.actions.setCompanyName = function(val){ App.state.meta.companyName = val.trim() || 'Company'; save(); };
-App.actions.setEditWindow = function(val){ App.state.meta.editWindowHours = Number(val)||24; save(); };
+App.actions.setUserName = function(val){ setDoc(doc(db,'meta','settings'), {currentUser: val.trim() || 'Operator'}, {merge:true}).catch(function(e){ toast('Failed to save: '+e.message,'err'); }); };
+App.actions.setCompanyName = function(val){ setDoc(doc(db,'meta','settings'), {companyName: val.trim() || 'Company'}, {merge:true}).catch(function(e){ toast('Failed to save: '+e.message,'err'); }); };
+App.actions.setEditWindow = function(val){ setDoc(doc(db,'meta','settings'), {editWindowHours: Number(val)||24}, {merge:true}).catch(function(e){ toast('Failed to save: '+e.message,'err'); }); };
 App.actions.exportJSON = function(){
   downloadBlob(JSON.stringify(App.state, null, 2), 'application/json', 'mop-packing-data.json');
 };
@@ -1316,32 +1523,71 @@ App.actions.importJSONFile = function(inputEl){
   const file = inputEl.files[0];
   if(!file) return;
   const reader = new FileReader();
-  reader.onload = function(e){
+  reader.onload = async function(e){
     try{
       const parsed = JSON.parse(e.target.result);
-      if(!confirm('Import will replace all current data. Continue?')) return;
-      App.state = parsed;
-      if(!App.state.meta) App.state.meta = defaultState().meta;
-      if(!App.state.stock) App.state.stock = {};
-      if(!App.state.transactions) App.state.transactions = [];
-      if(!App.state.ledger) App.state.ledger = [];
-      save(); render(); toast('Data imported', 'ok');
+      if(!confirm('Import will ADD these records into the shared cloud database (existing data is not removed). Continue?')) return;
+
+      const collections = ['products','stock','transactions','materialInSheets','ledger'];
+      const writes = [];
+      collections.forEach(function(col){
+        const items = parsed[col];
+        if(!items) return;
+        if(col==='stock'){
+          Object.keys(items).forEach(function(pid){ writes.push({ref: doc(db,'stock',pid), data: items[pid]}); });
+        } else if(Array.isArray(items)){
+          items.forEach(function(item){
+            const id = item.id || uid(col);
+            const data = Object.assign({}, item); delete data.id;
+            writes.push({ref: doc(db,col,id), data: data});
+          });
+        }
+      });
+      if(parsed.meta) writes.push({ref: doc(db,'meta','settings'), data: parsed.meta});
+
+      // Firestore batches max out at 500 writes -- chunk to be safe.
+      for(let i=0;i<writes.length;i+=400){
+        const batch = writeBatch(db);
+        writes.slice(i,i+400).forEach(function(w){ batch.set(w.ref, w.data); });
+        await batch.commit();
+      }
+      toast('Data imported into the cloud', 'ok');
     }catch(err){
-      toast('Invalid JSON file', 'err');
+      toast('Import failed: '+err.message, 'err');
     }
   };
   reader.readAsText(file);
 };
-App.actions.clearAllData = function(){
-  if(!confirm('This will permanently erase all packing data in this browser. Continue?')) return;
+App.actions.clearAllData = async function(){
+  if(!confirm('This will permanently erase ALL shared cloud data for every device using this app. Continue?')) return;
   if(!confirm('Really sure? This cannot be undone.')) return;
-  App.state = defaultState();
-  save(); render(); toast('All data cleared', 'ok');
+  try{
+    const collections = ['products','stock','transactions','materialInSheets','ledger'];
+    for(const col of collections){
+      const snap = await getDocs(collection(db,col));
+      const refs = snap.docs.map(function(d){ return d.ref; });
+      for(let i=0;i<refs.length;i+=400){
+        const batch = writeBatch(db);
+        refs.slice(i,i+400).forEach(function(ref){ batch.delete(ref); });
+        await batch.commit();
+      }
+    }
+    await setDoc(doc(db,'meta','settings'), defaultState().meta);
+    toast('All cloud data cleared', 'ok');
+  }catch(e){
+    toast('Failed to clear data: '+e.message, 'err');
+  }
 };
 
 /* ---------------- init ---------------- */
-load();
-render();
+render(); // shows the "Connecting..." state immediately
+onAuthStateChanged(auth, function(user){
+  if(user) attachListeners();
+});
+signInAnonymously(auth).catch(function(e){
+  App.ui.connectionError = e.message;
+  render();
+});
 </script>
 </body>
 </html>

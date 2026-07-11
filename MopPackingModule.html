@@ -538,6 +538,19 @@ function renderNav(){
 }
 
 function render(){
+  // Preserve whatever the user is currently typing into, since every
+  // state change re-renders the view by replacing innerHTML (which
+  // would otherwise destroy the focused element and drop keyboard focus
+  // after every single keystroke).
+  const active = document.activeElement;
+  let focusId = null, selStart = null, selEnd = null;
+  if(active && active.id){
+    focusId = active.id;
+    if(typeof active.selectionStart === 'number'){
+      try{ selStart = active.selectionStart; selEnd = active.selectionEnd; }catch(e){}
+    }
+  }
+
   renderNav();
   const view = document.getElementById('view');
   const fn = {
@@ -550,6 +563,16 @@ function render(){
     settings: viewSettings
   }[App.ui.tab];
   view.innerHTML = fn();
+
+  if(focusId){
+    const el = document.getElementById(focusId);
+    if(el){
+      el.focus();
+      if(selStart !== null && el.setSelectionRange){
+        try{ el.setSelectionRange(selStart, selEnd); }catch(e){}
+      }
+    }
+  }
 }
 
 /* ================= DASHBOARD ================= */
@@ -623,17 +646,17 @@ function renderLineRow(line, i){
     fields =
       '<div class="field" style="margin-bottom:0;"><label>Product</label><select onchange="App.actions.refillLineSetField('+i+',\'productId\',this.value)">' +
       '<option value="">Select\u2026</option>' + productOptionsPlain(line.productId) + '</select></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>PCS/Bag</label><input type="number" min="1" class="mono" value="'+escapeHtml(line.pcsPerBag)+'" oninput="App.actions.refillLineSetField('+i+',\'pcsPerBag\',this.value)"></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Bags</label><input type="number" min="1" class="mono" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></div>';
+      '<div class="field" style="margin-bottom:0;"><label>PCS/Bag</label><input id="line_'+i+'_pcsPerBag" type="number" min="1" class="mono" value="'+escapeHtml(line.pcsPerBag)+'" oninput="App.actions.refillLineSetField('+i+',\'pcsPerBag\',this.value)"></div>' +
+      '<div class="field" style="margin-bottom:0;"><label>Bags</label><input id="line_'+i+'_bags" type="number" min="1" class="mono" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></div>';
   } else {
     fields =
       '<div class="field" style="margin-bottom:0;"><label>Product A</label><select onchange="App.actions.refillLineSetField('+i+',\'productId\',this.value)">' +
       '<option value="">Select\u2026</option>' + productOptionsPlain(line.productId) + '</select></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Qty A / bag</label><input type="number" min="0" class="mono" value="'+escapeHtml(line.qtyA)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyA\',this.value)"></div>' +
+      '<div class="field" style="margin-bottom:0;"><label>Qty A / bag</label><input id="line_'+i+'_qtyA" type="number" min="0" class="mono" value="'+escapeHtml(line.qtyA)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyA\',this.value)"></div>' +
       '<div class="field" style="margin-bottom:0;"><label>Product B</label><select onchange="App.actions.refillLineSetField('+i+',\'productIdB\',this.value)">' +
       '<option value="">Select\u2026</option>' + productOptionsPlain(line.productIdB) + '</select></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Qty B / bag</label><input type="number" min="0" class="mono" value="'+escapeHtml(line.qtyB)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyB\',this.value)"></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Bags</label><input type="number" min="1" class="mono" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></div>';
+      '<div class="field" style="margin-bottom:0;"><label>Qty B / bag</label><input id="line_'+i+'_qtyB" type="number" min="0" class="mono" value="'+escapeHtml(line.qtyB)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyB\',this.value)"></div>' +
+      '<div class="field" style="margin-bottom:0;"><label>Bags</label><input id="line_'+i+'_bags" type="number" min="1" class="mono" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></div>';
   }
   return '<div class="card" style="margin-bottom:10px;">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
@@ -689,13 +712,13 @@ function viewRefillNewSheet(){
 
   html += '<div class="card" style="margin-bottom:16px;">' +
     '<div class="field-row">' +
-    '<div class="field"><label>Date</label><input type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.refillSheetSetField(\'date\',this.value)"></div>' +
-    '<div class="field"><label>Challan no.</label><input class="mono" value="'+escapeHtml(f.challanNo)+'" oninput="App.actions.refillSheetSetField(\'challanNo\',this.value)" placeholder="e.g. CH-0101"></div>' +
+    '<div class="field"><label>Date</label><input id="sheetDate" type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.refillSheetSetField(\'date\',this.value)"></div>' +
+    '<div class="field"><label>Challan no.</label><input id="sheetChallanNo" class="mono" value="'+escapeHtml(f.challanNo)+'" oninput="App.actions.refillSheetSetField(\'challanNo\',this.value)" placeholder="e.g. CH-0101"></div>' +
     '</div>' +
-    '<div class="field"><label>Sheet title (optional)</label><input value="'+escapeHtml(f.sheetTitle)+'" oninput="App.actions.refillSheetSetField(\'sheetTitle\',this.value)" placeholder="e.g. Zedello Mop Refil Stock"></div>' +
+    '<div class="field"><label>Sheet title (optional)</label><input id="sheetTitle" value="'+escapeHtml(f.sheetTitle)+'" oninput="App.actions.refillSheetSetField(\'sheetTitle\',this.value)" placeholder="e.g. Zedello Mop Refil Stock"></div>' +
     '<div class="field-row">' +
-    '<div class="field"><label>Received by</label><input value="'+escapeHtml(f.receivedBy)+'" oninput="App.actions.refillSheetSetField(\'receivedBy\',this.value)"></div>' +
-    '<div class="field"><label>Verified by</label><input value="'+escapeHtml(f.verifiedBy)+'" oninput="App.actions.refillSheetSetField(\'verifiedBy\',this.value)"></div>' +
+    '<div class="field"><label>Received by</label><input id="sheetReceivedBy" value="'+escapeHtml(f.receivedBy)+'" oninput="App.actions.refillSheetSetField(\'receivedBy\',this.value)"></div>' +
+    '<div class="field"><label>Verified by</label><input id="sheetVerifiedBy" value="'+escapeHtml(f.verifiedBy)+'" oninput="App.actions.refillSheetSetField(\'verifiedBy\',this.value)"></div>' +
     '</div>' +
     '</div>';
 
@@ -762,16 +785,16 @@ function viewPack(){
   if(d.productId){
     html += '<div class="balance-hint">Refill balance: <strong style="margin-left:4px;">'+st.refill+' pcs</strong> \u00b7 carton size: '+cartonSize+' pcs</div>';
     html += '<div class="field"><label>Quantity to pack (pieces)</label>' +
-      '<input type="number" min="1" max="'+st.refill+'" class="mono" value="'+escapeHtml(d.qty)+'" oninput="App.actions.packSetField(\'qty\',this.value)" placeholder="e.g. 240"></div>';
+      '<input id="packQty" type="number" min="1" max="'+st.refill+'" class="mono" value="'+escapeHtml(d.qty)+'" oninput="App.actions.packSetField(\'qty\',this.value)" placeholder="e.g. 240"></div>';
 
     if(qty>0){
       html += '<div class="preview-box">= <strong>'+cartons+'</strong> complete carton(s)' + (loose>0?' + <strong>'+loose+'</strong> loose piece(s)':' + 0 loose pieces') + '</div>';
     }
 
     html += '<div class="field"><label>Packing challan no.</label>' +
-      '<input class="mono" value="'+escapeHtml(d.challanNo)+'" oninput="App.actions.packSetField(\'challanNo\',this.value)" placeholder="e.g. CH-0114"></div>';
+      '<input id="packChallanNo" class="mono" value="'+escapeHtml(d.challanNo)+'" oninput="App.actions.packSetField(\'challanNo\',this.value)" placeholder="e.g. CH-0114"></div>';
     html += '<div class="field"><label>Note (optional)</label>' +
-      '<textarea oninput="App.actions.packSetField(\'note\',this.value)" placeholder="Shift, line, remark">'+escapeHtml(d.note||'')+'</textarea></div>';
+      '<textarea id="packNote" oninput="App.actions.packSetField(\'note\',this.value)" placeholder="Shift, line, remark">'+escapeHtml(d.note||'')+'</textarea></div>';
 
     html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;" onclick="App.actions.packSubmit()">Confirm pack &amp; stamp</button>';
   }
@@ -892,7 +915,7 @@ function viewLedger(){
     '<option value="finished"'+(f.area==='finished'?' selected':'')+'>Finished goods</option>' +
     '<option value="loose"'+(f.area==='loose'?' selected':'')+'>Loose pieces</option>' +
     '</select>' +
-    '<input placeholder="Search product / challan / reason\u2026" value="'+escapeHtml(f.q||'')+'" oninput="App.actions.ledgerSearch(this.value)" style="flex:1;min-width:180px;padding:7px 10px;border:1.5px solid var(--line-strong);border-radius:6px;">' +
+    '<input id="ledgerSearchBox" placeholder="Search product / challan / reason\u2026" value="'+escapeHtml(f.q||'')+'" oninput="App.actions.ledgerSearch(this.value)" style="flex:1;min-width:180px;padding:7px 10px;border:1.5px solid var(--line-strong);border-radius:6px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="App.actions.exportLedgerCSV()">Export CSV</button>' +
     '</div>';
 

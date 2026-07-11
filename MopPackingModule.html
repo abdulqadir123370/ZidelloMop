@@ -619,11 +619,20 @@ function render(){
   // state change re-renders the view by replacing innerHTML (which
   // would otherwise destroy the focused element and drop keyboard focus
   // after every single keystroke).
+  //
+  // NOTE: type="number" inputs do not reliably support selectionStart /
+  // setSelectionRange in browsers (Chrome throws or returns 0 for them),
+  // so cursor-position restoration is only attempted for text-like
+  // fields. For number inputs we still restore focus, just not the
+  // cursor position -- trying to do so previously caused the cursor to
+  // snap to position 0 after every keystroke, which made new digits get
+  // inserted at the *front* of the value instead of the end.
   const active = document.activeElement;
   let focusId = null, selStart = null, selEnd = null;
   if(active && active.id){
     focusId = active.id;
-    if(typeof active.selectionStart === 'number'){
+    const type = (active.tagName === 'TEXTAREA') ? 'textarea' : (active.type || '');
+    if(type==='text' || type==='textarea' || type==='search' || type==='tel' || type==='url'){
       try{ selStart = active.selectionStart; selEnd = active.selectionEnd; }catch(e){}
     }
   }
@@ -735,17 +744,17 @@ function renderLineRow(line, i){
     fields =
       '<div class="field" style="margin-bottom:0;"><label>Product</label><select onchange="App.actions.refillLineSetField('+i+',\'productId\',this.value)">' +
       '<option value="">Select\u2026</option>' + productOptionsPlain(line.productId) + '</select></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>PCS/Bag</label><input id="line_'+i+'_pcsPerBag" type="number" min="1" class="mono" value="'+escapeHtml(line.pcsPerBag)+'" oninput="App.actions.refillLineSetField('+i+',\'pcsPerBag\',this.value)"></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Bags</label><input id="line_'+i+'_bags" type="number" min="1" class="mono" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></div>';
+      '<div class="field" style="margin-bottom:0;"><label>PCS/Bag</label><input id="line_'+i+'_pcsPerBag" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.pcsPerBag)+'" oninput="App.actions.refillLineSetField('+i+',\'pcsPerBag\',this.value)"></div>' +
+      '<div class="field" style="margin-bottom:0;"><label>Bags</label><input id="line_'+i+'_bags" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></div>';
   } else {
     fields =
       '<div class="field" style="margin-bottom:0;"><label>Product A</label><select onchange="App.actions.refillLineSetField('+i+',\'productId\',this.value)">' +
       '<option value="">Select\u2026</option>' + productOptionsPlain(line.productId) + '</select></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Qty A / bag</label><input id="line_'+i+'_qtyA" type="number" min="0" class="mono" value="'+escapeHtml(line.qtyA)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyA\',this.value)"></div>' +
+      '<div class="field" style="margin-bottom:0;"><label>Qty A / bag</label><input id="line_'+i+'_qtyA" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qtyA)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyA\',this.value)"></div>' +
       '<div class="field" style="margin-bottom:0;"><label>Product B</label><select onchange="App.actions.refillLineSetField('+i+',\'productIdB\',this.value)">' +
       '<option value="">Select\u2026</option>' + productOptionsPlain(line.productIdB) + '</select></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Qty B / bag</label><input id="line_'+i+'_qtyB" type="number" min="0" class="mono" value="'+escapeHtml(line.qtyB)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyB\',this.value)"></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Bags</label><input id="line_'+i+'_bags" type="number" min="1" class="mono" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></div>';
+      '<div class="field" style="margin-bottom:0;"><label>Qty B / bag</label><input id="line_'+i+'_qtyB" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qtyB)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyB\',this.value)"></div>' +
+      '<div class="field" style="margin-bottom:0;"><label>Bags</label><input id="line_'+i+'_bags" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></div>';
   }
   return '<div class="card" style="margin-bottom:10px;">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
@@ -874,7 +883,7 @@ function viewPack(){
   if(d.productId){
     html += '<div class="balance-hint">Refill balance: <strong style="margin-left:4px;">'+st.refill+' pcs</strong> \u00b7 carton size: '+cartonSize+' pcs</div>';
     html += '<div class="field"><label>Quantity to pack (pieces)</label>' +
-      '<input id="packQty" type="number" min="1" max="'+st.refill+'" class="mono" value="'+escapeHtml(d.qty)+'" oninput="App.actions.packSetField(\'qty\',this.value)" placeholder="e.g. 240"></div>';
+      '<input id="packQty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(d.qty)+'" oninput="App.actions.packSetField(\'qty\',this.value)" placeholder="e.g. 240"></div>';
 
     if(qty>0){
       html += '<div class="preview-box">= <strong>'+cartons+'</strong> complete carton(s)' + (loose>0?' + <strong>'+loose+'</strong> loose piece(s)':' + 0 loose pieces') + '</div>';
@@ -1023,9 +1032,9 @@ function viewSettings(){
     '<div class="card" style="margin-bottom:22px;">' +
     '<div class="field-row">' +
     '<div class="field" style="margin-bottom:0;"><label>Name</label><input id="newProdName" placeholder="e.g. Premium 16&quot;"></div>' +
-    '<div class="field" style="margin-bottom:0;"><label>Standard PCS/Bag (optional)</label><input id="newProdPcsBag" type="number" min="1" class="mono" placeholder="e.g. 240"></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Standard PCS/Bag (optional)</label><input id="newProdPcsBag" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" placeholder="e.g. 240"></div>' +
     '</div>' +
-    '<div class="field" style="max-width:260px;"><label>Carton size (pieces per carton, for Packing)</label><input id="newProdCarton" type="number" min="1" class="mono" placeholder="e.g. 100"></div>' +
+    '<div class="field" style="max-width:260px;"><label>Carton size (pieces per carton, for Packing)</label><input id="newProdCarton" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" placeholder="e.g. 100"></div>' +
     '<button class="btn btn-primary" style="margin-top:4px;" onclick="App.actions.addProduct()">Add product</button>';
   if(s.products.length){
     html += '<div class="tbl-wrap" style="margin-top:16px;"><table><thead><tr><th>Product</th><th>Std PCS/Bag</th><th>Carton size</th><th></th></tr></thead><tbody>' +
@@ -1047,7 +1056,7 @@ function viewSettings(){
     '<input value="'+escapeHtml(s.meta.currentUser||'')+'" onchange="App.actions.setUserName(this.value)"></div>' +
     '</div>' +
     '<div class="field" style="max-width:200px;"><label>Void window (hours)</label>' +
-    '<input type="number" min="1" class="mono" value="'+(s.meta.editWindowHours||24)+'" onchange="App.actions.setEditWindow(this.value)"></div>' +
+    '<input type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+(s.meta.editWindowHours||24)+'" onchange="App.actions.setEditWindow(this.value)"></div>' +
     '<div class="hint">Any transaction can be voided (fully reversed) within this window.</div>' +
     '</div>';
 
@@ -1317,7 +1326,7 @@ App.actions.openLooseReturnModal = function(){
     '<div class="field"><label>Product</label><select id="f_product" onchange="App.actions.looseModalRefresh(this.value)">' +
     '<option value="">Select\u2026</option>' + productOptions() + '</select></div>' +
     '<div id="looseBalanceHint"></div>' +
-    '<div class="field"><label>Quantity to return (pieces)</label><input id="f_qty" type="number" min="1" class="mono"></div>' +
+    '<div class="field"><label>Quantity to return (pieces)</label><input id="f_qty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono"></div>' +
     '<div class="field"><label>Return challan no.</label><input id="f_challan" class="mono" placeholder="e.g. CH-0212"></div>' +
     '<div class="field"><label>Note (optional)</label><input id="f_note" placeholder="Remark"></div>' +
     '<div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal()">Cancel</button>' +
@@ -1374,7 +1383,7 @@ App.actions.openDispatchModal = function(){
     '<div class="field"><label>Product</label><select id="f_product" onchange="App.actions.dispatchModalRefresh(this.value)">' +
     '<option value="">Select\u2026</option>' + productOptions() + '</select></div>' +
     '<div id="dispatchBalanceHint"></div>' +
-    '<div class="field"><label>Cartons to dispatch</label><input id="f_qty" type="number" min="1" class="mono"></div>' +
+    '<div class="field"><label>Cartons to dispatch</label><input id="f_qty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono"></div>' +
     '<div class="field"><label>Dispatch challan no.</label><input id="f_challan" class="mono" placeholder="e.g. CH-0300"></div>' +
     '<div class="field"><label>Destination / buyer (optional)</label><input id="f_dest" placeholder="Shop, city, distributor"></div>' +
     '<div class="field"><label>Note (optional)</label><input id="f_note" placeholder="Remark"></div>' +

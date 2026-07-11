@@ -390,6 +390,12 @@ const App = {
   },
   actions:{}
 };
+// This script runs as an ES module (required for the Firebase imports above),
+// which means its top-level consts/functions are NOT visible to inline
+// onclick="..." HTML attributes -- those always execute in the plain global
+// scope. Explicitly attach what the inline handlers need onto window.
+window.App = App;
+window.closeModal = closeModal;
 
 /* ---------------- Firebase init + real-time listeners ---------------- */
 const firebaseApp = initializeApp(firebaseConfig);

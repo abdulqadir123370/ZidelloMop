@@ -639,6 +639,30 @@ function lineValid(line){
   return line.productId && Number(line.pcsPerBag)>0 && Number(line.bags)>0;
 }
 
+// Guards against accidentally saving the same paper sheet twice (the same
+// date/title/line-items submitted minutes apart) -- catches both fumbled
+// double entry and a resubmit-after-a-flaky-network-error, since either one
+// silently doubles stock without changing any total that looks "off" at a
+// glance (every affected material scales by the same factor).
+const DUPLICATE_SHEET_WINDOW_MS = 15 * 60 * 1000;
+function normalizeLines(lines){
+  return JSON.stringify((lines||[]).map(function(l){
+    return {
+      mode: l.mode||'single', productId: l.productId||'', productIdB: l.productIdB||'',
+      pcsPerBag: Number(l.pcsPerBag)||0, bags: Number(l.bags)||0,
+      qtyA: Number(l.qtyA)||0, qtyB: Number(l.qtyB)||0
+    };
+  }));
+}
+function findRecentDuplicateSheet(list, date, sheetTitle, lines){
+  const key = normalizeLines(lines);
+  const cutoff = Date.now() - DUPLICATE_SHEET_WINDOW_MS;
+  return list.find(function(s){
+    return !s.voided && s.date===date && (s.sheetTitle||'')===(sheetTitle||'') &&
+      s.createdAt>=cutoff && normalizeLines(s.lines)===key;
+  });
+}
+
 /* ---------------- pure data builders (no side effects -- used inside Firestore transactions) ---------------- */
 function editWindowMs(){
   return Number(App.state.meta.editWindowHours || 24) * 3600 * 1000;
@@ -1559,6 +1583,11 @@ App.actions.refillSubmitSheet = async function(){
   if(!f.date) return toast('Select a date', 'err');
   const validLines = f.lines.filter(lineValid);
   if(!validLines.length) return toast('Add at least one valid line item', 'err');
+
+  const dup = findRecentDuplicateSheet(App.state.materialInSheets, f.date, f.sheetTitle, validLines);
+  if(dup && !confirm('A sheet with the exact same date, title and items was already saved '+timeAgo(dup.createdAt)+' as Challan '+dup.challanNo+'. Submit this one anyway?')){
+    return;
+  }
 
   const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
 

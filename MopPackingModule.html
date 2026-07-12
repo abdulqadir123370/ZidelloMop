@@ -764,7 +764,10 @@ function viewDashboard(){
     totalFinished += finishedStockFor(p.id).finished;
   });
   const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-  const dispatchesToday = s.transactions.filter(function(t){return t.type==='dispatch' && !t.voided && t.ts>=todayStart.getTime();}).length;
+  const dispatchesToday = new Set(
+    s.transactions.filter(function(t){return t.type==='dispatch' && !t.voided && t.ts>=todayStart.getTime();})
+      .map(function(t){return t.challanNo;})
+  ).size;
 
   let html = '<div class="grid grid-stats">' +
     statCard('Raw material on hand', totalRefill+' pcs', s.rawMaterials.length+' raw material(s)', '') +
@@ -1099,9 +1102,22 @@ function viewPack(){
 function newLooseSheetForm(){
   return { date: todayISO(), lines: [{productId:'', qty:''}] };
 }
+function looseLineReservedBySiblings(i){
+  const f = App.ui.looseSheetForm;
+  const line = f.lines[i];
+  if(!line.productId) return 0;
+  let reserved = 0;
+  for(let j=0;j<i;j++){
+    if(f.lines[j].productId === line.productId) reserved += Number(f.lines[j].qty)||0;
+  }
+  return reserved;
+}
 function renderLooseLineRow(line, i){
   const st = line.productId ? rawStockFor(line.productId) : null;
   const qty = Number(line.qty)||0;
+  const rawBalance = st ? st.loose : 0;
+  const reserved = line.productId ? looseLineReservedBySiblings(i) : 0;
+  const availBalance = rawBalance - reserved;
   let html = '<div class="card" style="margin-bottom:10px;">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
     '<div class="eyebrow">Line '+(i+1)+'</div>' +
@@ -1113,8 +1129,11 @@ function renderLooseLineRow(line, i){
     '<input type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.looseLineSetField('+i+',\'qty\',this.value)"></div>' +
     '</div>';
   if(line.productId){
-    const short = qty > (st?st.loose:0);
-    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Loose balance: <strong style="margin-left:4px;">'+(st?st.loose:0)+' pcs</strong>'+(short?' \u2014 not enough loose pieces':'')+'</div>';
+    const short = qty > availBalance;
+    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Loose balance: <strong style="margin-left:4px;">'+availBalance+' pcs</strong>'+(short?' \u2014 not enough loose pieces':'')+'</div>';
+    if(reserved>0){
+      html += '<div class="hint" style="margin-top:4px;">'+rawBalance+' pcs in stock \u2014 '+reserved+' pcs already claimed by earlier line(s) using this raw material in this sheet</div>';
+    }
   }
   html += '</div>';
   return html;
@@ -1195,9 +1214,22 @@ function viewLoose(){
 function newDispatchSheetForm(){
   return { date: todayISO(), destination:'', note:'', lines: [{productId:'', qty:''}] };
 }
+function dispatchLineReservedBySiblings(i){
+  const f = App.ui.dispatchSheetForm;
+  const line = f.lines[i];
+  if(!line.productId) return 0;
+  let reserved = 0;
+  for(let j=0;j<i;j++){
+    if(f.lines[j].productId === line.productId) reserved += Number(f.lines[j].qty)||0;
+  }
+  return reserved;
+}
 function renderDispatchLineRow(line, i){
   const st = line.productId ? finishedStockFor(line.productId) : null;
   const qty = Number(line.qty)||0;
+  const rawBalance = st ? st.finished : 0;
+  const reserved = line.productId ? dispatchLineReservedBySiblings(i) : 0;
+  const availBalance = rawBalance - reserved;
   let html = '<div class="card" style="margin-bottom:10px;">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
     '<div class="eyebrow">Line '+(i+1)+'</div>' +
@@ -1209,8 +1241,11 @@ function renderDispatchLineRow(line, i){
     '<input type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.dispatchLineSetField('+i+',\'qty\',this.value)"></div>' +
     '</div>';
   if(line.productId){
-    const short = qty > (st?st.finished:0);
-    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Finished goods: <strong style="margin-left:4px;">'+(st?st.finished:0)+' cartons</strong>'+(short?' \u2014 not enough stock':'')+'</div>';
+    const short = qty > availBalance;
+    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Finished goods: <strong style="margin-left:4px;">'+availBalance+' cartons</strong>'+(short?' \u2014 not enough stock':'')+'</div>';
+    if(reserved>0){
+      html += '<div class="hint" style="margin-top:4px;">'+rawBalance+' cartons in stock \u2014 '+reserved+' already claimed by earlier line(s) using this product in this sheet</div>';
+    }
   }
   html += '</div>';
   return html;
@@ -2164,12 +2199,20 @@ function downloadBlob(content, mime, filename){
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+// Guards against CSV/formula injection: a cell starting with =, +, -, or @
+// is interpreted as a formula by Excel/Sheets when the file is opened, so
+// prefix it with a leading quote to force it to be read as plain text.
+function csvCell(v){
+  let s = String(v==null?'':v);
+  if(/^[=+\-@]/.test(s)) s = "'"+s;
+  return '"'+s.replace(/"/g,'""')+'"';
+}
 App.actions.exportLedgerCSV = function(){
   const rows = [['When','Area','Product','Change','Balance','Reason','Challan','By']];
   App.state.ledger.slice().sort(function(a,b){return a.ts-b.ts;}).forEach(function(r){
     rows.push([fmtDateTime(r.ts), r.area, productNameForArea(r.area, r.productId), r.delta, r.balanceAfter, r.reason, r.challanNo, r.user]);
   });
-  const csv = rows.map(function(r){return r.map(function(c){return '"'+String(c).replace(/"/g,'""')+'"';}).join(',');}).join('\n');
+  const csv = rows.map(function(r){return r.map(csvCell).join(',');}).join('\n');
   downloadBlob(csv, 'text/csv', 'packing-ledger.csv');
 };
 App.actions.exportDispatchCSV = function(){
@@ -2177,7 +2220,7 @@ App.actions.exportDispatchCSV = function(){
   App.state.transactions.filter(function(t){return t.type==='dispatch';}).sort(function(a,b){return a.ts-b.ts;}).forEach(function(t){
     rows.push([fmtDate(t.ts), t.challanNo, finishedProductName(t.productId), t.qty, t.destination||'', t.note||'', t.voided?'Yes':'No']);
   });
-  const csv = rows.map(function(r){return r.map(function(c){return '"'+String(c).replace(/"/g,'""')+'"';}).join(',');}).join('\n');
+  const csv = rows.map(function(r){return r.map(csvCell).join(',');}).join('\n');
   downloadBlob(csv, 'text/csv', 'dispatch-report.csv');
 };
 

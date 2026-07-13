@@ -418,7 +418,7 @@ const App = {
     dispatchMode:'list',
     dispatchSheetForm:null,
     viewingDispatchSheetId:null,
-    ledgerFilter:{area:'all', q:''},
+    ledgerFilter:{area:'all', department:'all', productId:'', user:'all', from:'', to:'', q:''},
     reportFilter:{from:'', to:''}
   },
   actions:{}
@@ -639,30 +639,6 @@ function lineValid(line){
   return line.productId && Number(line.pcsPerBag)>0 && Number(line.bags)>0;
 }
 
-// Guards against accidentally saving the same paper sheet twice (the same
-// date/title/line-items submitted minutes apart) -- catches both fumbled
-// double entry and a resubmit-after-a-flaky-network-error, since either one
-// silently doubles stock without changing any total that looks "off" at a
-// glance (every affected material scales by the same factor).
-const DUPLICATE_SHEET_WINDOW_MS = 15 * 60 * 1000;
-function normalizeLines(lines){
-  return JSON.stringify((lines||[]).map(function(l){
-    return {
-      mode: l.mode||'single', productId: l.productId||'', productIdB: l.productIdB||'',
-      pcsPerBag: Number(l.pcsPerBag)||0, bags: Number(l.bags)||0,
-      qtyA: Number(l.qtyA)||0, qtyB: Number(l.qtyB)||0
-    };
-  }));
-}
-function findRecentDuplicateSheet(list, date, sheetTitle, lines){
-  const key = normalizeLines(lines);
-  const cutoff = Date.now() - DUPLICATE_SHEET_WINDOW_MS;
-  return list.find(function(s){
-    return !s.voided && s.date===date && (s.sheetTitle||'')===(sheetTitle||'') &&
-      s.createdAt>=cutoff && normalizeLines(s.lines)===key;
-  });
-}
-
 /* ---------------- pure data builders (no side effects -- used inside Firestore transactions) ---------------- */
 function editWindowMs(){
   return Number(App.state.meta.editWindowHours || 24) * 3600 * 1000;
@@ -788,10 +764,7 @@ function viewDashboard(){
     totalFinished += finishedStockFor(p.id).finished;
   });
   const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-  const dispatchesToday = new Set(
-    s.transactions.filter(function(t){return t.type==='dispatch' && !t.voided && t.ts>=todayStart.getTime();})
-      .map(function(t){return t.challanNo;})
-  ).size;
+  const dispatchesToday = s.transactions.filter(function(t){return t.type==='dispatch' && !t.voided && t.ts>=todayStart.getTime();}).length;
 
   let html = '<div class="grid grid-stats">' +
     statCard('Raw material on hand', totalRefill+' pcs', s.rawMaterials.length+' raw material(s)', '') +
@@ -1126,22 +1099,9 @@ function viewPack(){
 function newLooseSheetForm(){
   return { date: todayISO(), lines: [{productId:'', qty:''}] };
 }
-function looseLineReservedBySiblings(i){
-  const f = App.ui.looseSheetForm;
-  const line = f.lines[i];
-  if(!line.productId) return 0;
-  let reserved = 0;
-  for(let j=0;j<i;j++){
-    if(f.lines[j].productId === line.productId) reserved += Number(f.lines[j].qty)||0;
-  }
-  return reserved;
-}
 function renderLooseLineRow(line, i){
   const st = line.productId ? rawStockFor(line.productId) : null;
   const qty = Number(line.qty)||0;
-  const rawBalance = st ? st.loose : 0;
-  const reserved = line.productId ? looseLineReservedBySiblings(i) : 0;
-  const availBalance = rawBalance - reserved;
   let html = '<div class="card" style="margin-bottom:10px;">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
     '<div class="eyebrow">Line '+(i+1)+'</div>' +
@@ -1150,14 +1110,11 @@ function renderLooseLineRow(line, i){
     '<div class="field" style="margin-bottom:0;"><label>Raw material</label><select onchange="App.actions.looseLineSetField('+i+',\'productId\',this.value)">' +
     '<option value="">Select\u2026</option>' + rawMaterialOptionsPlain(line.productId) + '</select></div>' +
     '<div class="field" style="margin-bottom:0;"><label>Qty to return</label>' +
-    '<input type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.looseLineSetField('+i+',\'qty\',this.value)"></div>' +
+    '<input id="looseline_'+i+'_qty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.looseLineSetField('+i+',\'qty\',this.value)"></div>' +
     '</div>';
   if(line.productId){
-    const short = qty > availBalance;
-    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Loose balance: <strong style="margin-left:4px;">'+availBalance+' pcs</strong>'+(short?' \u2014 not enough loose pieces':'')+'</div>';
-    if(reserved>0){
-      html += '<div class="hint" style="margin-top:4px;">'+rawBalance+' pcs in stock \u2014 '+reserved+' pcs already claimed by earlier line(s) using this raw material in this sheet</div>';
-    }
+    const short = qty > (st?st.loose:0);
+    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Loose balance: <strong style="margin-left:4px;">'+(st?st.loose:0)+' pcs</strong>'+(short?' \u2014 not enough loose pieces':'')+'</div>';
   }
   html += '</div>';
   return html;
@@ -1238,22 +1195,9 @@ function viewLoose(){
 function newDispatchSheetForm(){
   return { date: todayISO(), destination:'', note:'', lines: [{productId:'', qty:''}] };
 }
-function dispatchLineReservedBySiblings(i){
-  const f = App.ui.dispatchSheetForm;
-  const line = f.lines[i];
-  if(!line.productId) return 0;
-  let reserved = 0;
-  for(let j=0;j<i;j++){
-    if(f.lines[j].productId === line.productId) reserved += Number(f.lines[j].qty)||0;
-  }
-  return reserved;
-}
 function renderDispatchLineRow(line, i){
   const st = line.productId ? finishedStockFor(line.productId) : null;
   const qty = Number(line.qty)||0;
-  const rawBalance = st ? st.finished : 0;
-  const reserved = line.productId ? dispatchLineReservedBySiblings(i) : 0;
-  const availBalance = rawBalance - reserved;
   let html = '<div class="card" style="margin-bottom:10px;">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
     '<div class="eyebrow">Line '+(i+1)+'</div>' +
@@ -1262,14 +1206,11 @@ function renderDispatchLineRow(line, i){
     '<div class="field" style="margin-bottom:0;"><label>Finished product</label><select onchange="App.actions.dispatchLineSetField('+i+',\'productId\',this.value)">' +
     '<option value="">Select\u2026</option>' + finishedProductOptionsPlain(line.productId) + '</select></div>' +
     '<div class="field" style="margin-bottom:0;"><label>Cartons to dispatch</label>' +
-    '<input type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.dispatchLineSetField('+i+',\'qty\',this.value)"></div>' +
+    '<input id="dispatchline_'+i+'_qty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.dispatchLineSetField('+i+',\'qty\',this.value)"></div>' +
     '</div>';
   if(line.productId){
-    const short = qty > availBalance;
-    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Finished goods: <strong style="margin-left:4px;">'+availBalance+' cartons</strong>'+(short?' \u2014 not enough stock':'')+'</div>';
-    if(reserved>0){
-      html += '<div class="hint" style="margin-top:4px;">'+rawBalance+' cartons in stock \u2014 '+reserved+' already claimed by earlier line(s) using this product in this sheet</div>';
-    }
+    const short = qty > (st?st.finished:0);
+    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Finished goods: <strong style="margin-left:4px;">'+(st?st.finished:0)+' cartons</strong>'+(short?' \u2014 not enough stock':'')+'</div>';
   }
   html += '</div>';
   return html;
@@ -1325,10 +1266,10 @@ function viewDispatchNewSheet(){
     '<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchCancelNew()">Cancel</button></div>';
   html += '<div class="card" style="margin-bottom:16px;">' +
     '<div class="field-row">' +
-    '<div class="field"><label>Date</label><input type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.dispatchSheetSetField(\'date\',this.value)"></div>' +
-    '<div class="field"><label>Destination / buyer (optional)</label><input value="'+escapeHtml(f.destination)+'" oninput="App.actions.dispatchSheetSetField(\'destination\',this.value)" placeholder="Shop, city, distributor"></div>' +
+    '<div class="field"><label>Date</label><input id="dispatch_date" type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.dispatchSheetSetField(\'date\',this.value)"></div>' +
+    '<div class="field"><label>Destination / buyer (optional)</label><input id="dispatch_destination" value="'+escapeHtml(f.destination)+'" oninput="App.actions.dispatchSheetSetField(\'destination\',this.value)" placeholder="Shop, city, distributor"></div>' +
     '</div>' +
-    '<div class="field" style="margin-bottom:0;"><label>Note (optional)</label><input value="'+escapeHtml(f.note)+'" oninput="App.actions.dispatchSheetSetField(\'note\',this.value)"></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Note (optional)</label><input id="dispatch_note" value="'+escapeHtml(f.note)+'" oninput="App.actions.dispatchSheetSetField(\'note\',this.value)"></div>' +
     '</div>';
   html += '<div class="hint" style="margin:-10px 0 13px;">Challan number is assigned automatically when you save.</div>';
   html += '<label style="display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Line items</label>';
@@ -1370,41 +1311,100 @@ function viewDispatch(){
 }
 
 /* ================= LEDGER (all areas) ================= */
+function ledgerTxnTypeMap(){
+  const map = {};
+  App.state.transactions.forEach(function(t){ map[t.id] = t.type; });
+  return map;
+}
+function ledgerRowDepartment(r, txnTypeMap){
+  if(r.reason && r.reason.indexOf('Void')===0) return 'void';
+  const type = txnTypeMap[r.txnId];
+  if(type==='refill_in') return 'refill';
+  if(type==='pack') return 'pack';
+  if(type==='loose_return') return 'loose';
+  if(type==='dispatch') return 'dispatch';
+  return 'other';
+}
+const LEDGER_DEPARTMENT_LABELS = {refill:'Refill Stock', pack:'Pack', loose:'Loose Pieces', dispatch:'Dispatch', void:'Voided / reversal', other:'Other'};
+function ledgerProductOptions(selectedId){
+  let html = '';
+  if(App.state.rawMaterials.length){
+    html += '<optgroup label="Raw materials">' + App.state.rawMaterials.map(function(p){
+      return '<option value="'+p.id+'"'+(p.id===selectedId?' selected':'')+'>'+escapeHtml(p.name)+'</option>';
+    }).join('') + '</optgroup>';
+  }
+  if(App.state.finishedProducts.length){
+    html += '<optgroup label="Finished products">' + App.state.finishedProducts.map(function(p){
+      return '<option value="'+p.id+'"'+(p.id===selectedId?' selected':'')+'>'+escapeHtml(p.name)+'</option>';
+    }).join('') + '</optgroup>';
+  }
+  return html;
+}
+function ledgerUserOptions(selectedUser){
+  const users = App.state.ledger.reduce(function(arr,r){ if(r.user && arr.indexOf(r.user)===-1) arr.push(r.user); return arr; }, []);
+  users.sort();
+  return users.map(function(u){ return '<option value="'+escapeHtml(u)+'"'+(u===selectedUser?' selected':'')+'>'+escapeHtml(u)+'</option>'; }).join('');
+}
+function filteredLedgerRows(){
+  const f = App.ui.ledgerFilter;
+  const txnTypeMap = ledgerTxnTypeMap();
+  let rows = App.state.ledger.slice().sort(function(a,b){return b.ts-a.ts;});
+  if(f.area !== 'all') rows = rows.filter(function(r){return r.area===f.area;});
+  if(f.department !== 'all') rows = rows.filter(function(r){return ledgerRowDepartment(r, txnTypeMap)===f.department;});
+  if(f.productId) rows = rows.filter(function(r){return r.productId===f.productId;});
+  if(f.user !== 'all') rows = rows.filter(function(r){return r.user===f.user;});
+  if(f.from) rows = rows.filter(function(r){return r.ts >= new Date(f.from).getTime();});
+  if(f.to) rows = rows.filter(function(r){return r.ts <= new Date(f.to).getTime()+86399999;});
+  if(f.q){
+    const q = f.q.toLowerCase();
+    rows = rows.filter(function(r){return (productNameForArea(r.area, r.productId)+' '+r.challanNo+' '+r.reason).toLowerCase().includes(q);});
+  }
+  return rows;
+}
 function ledgerTable(rows){
-  return '<div class="tbl-wrap"><table><thead><tr><th>When</th><th>Product</th><th>Change</th><th>Balance</th><th>Reason</th><th>Challan</th><th>By</th></tr></thead><tbody>' +
+  const txnTypeMap = ledgerTxnTypeMap();
+  return '<div class="tbl-wrap"><table><thead><tr><th>When</th><th>Product</th><th>Department</th><th>Change</th><th>Balance</th><th>Reason</th><th>Challan</th><th>By</th></tr></thead><tbody>' +
     rows.map(function(r){
       return '<tr><td>'+fmtDateTime(r.ts)+'</td><td>'+escapeHtml(productNameForArea(r.area, r.productId))+'</td>' +
+        '<td>'+escapeHtml(LEDGER_DEPARTMENT_LABELS[ledgerRowDepartment(r, txnTypeMap)])+'</td>' +
         '<td class="mono '+(r.delta>=0?'delta-pos':'delta-neg')+'">'+(r.delta>=0?'+':'')+r.delta+'</td>' +
         '<td class="mono">'+r.balanceAfter+'</td><td>'+escapeHtml(r.reason)+'</td>' +
         '<td>'+tag(r.challanNo)+'</td><td>'+escapeHtml(r.user)+'</td></tr>';
     }).join('') + '</tbody></table></div>';
 }
 function viewLedger(){
-  const s = App.state;
   const f = App.ui.ledgerFilter;
-  let rows = s.ledger.slice().sort(function(a,b){return b.ts-a.ts;});
-  if(f.area !== 'all') rows = rows.filter(function(r){return r.area===f.area;});
-  if(f.q){
-    const q = f.q.toLowerCase();
-    rows = rows.filter(function(r){return (productNameForArea(r.area, r.productId)+' '+r.challanNo+' '+r.reason).toLowerCase().includes(q);});
-  }
+  const rows = filteredLedgerRows();
 
   let html = '<div class="section-head"><h2>Full stock ledger</h2></div>';
-  html += '<div class="card" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;padding:12px 16px;">' +
-    '<select onchange="App.actions.ledgerFilterArea(this.value)" style="padding:7px 10px;border:1.5px solid var(--line-strong);border-radius:6px;">' +
-    '<option value="all"'+(f.area==='all'?' selected':'')+'>All ledgers</option>' +
+  html += '<div class="card" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:14px;padding:12px 16px;">' +
+    '<div class="field" style="margin-bottom:0;"><label>From</label><input type="date" value="'+escapeHtml(f.from)+'" onchange="App.actions.ledgerFilterFrom(this.value)"></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>To</label><input type="date" value="'+escapeHtml(f.to)+'" onchange="App.actions.ledgerFilterTo(this.value)"></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Department</label><select onchange="App.actions.ledgerFilterDepartment(this.value)">' +
+    '<option value="all">All departments</option>' +
+    Object.keys(LEDGER_DEPARTMENT_LABELS).map(function(k){return '<option value="'+k+'"'+(f.department===k?' selected':'')+'>'+LEDGER_DEPARTMENT_LABELS[k]+'</option>';}).join('') +
+    '</select></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Stock area</label><select onchange="App.actions.ledgerFilterArea(this.value)">' +
+    '<option value="all"'+(f.area==='all'?' selected':'')+'>All areas</option>' +
     '<option value="refill"'+(f.area==='refill'?' selected':'')+'>Refill</option>' +
     '<option value="finished"'+(f.area==='finished'?' selected':'')+'>Finished goods</option>' +
     '<option value="loose"'+(f.area==='loose'?' selected':'')+'>Loose pieces</option>' +
-    '</select>' +
-    '<input id="ledgerSearchBox" placeholder="Search product / challan / reason\u2026" value="'+escapeHtml(f.q||'')+'" oninput="App.actions.ledgerSearch(this.value)" style="flex:1;min-width:180px;padding:7px 10px;border:1.5px solid var(--line-strong);border-radius:6px;">' +
+    '</select></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Product</label><select onchange="App.actions.ledgerFilterProduct(this.value)">' +
+    '<option value="">All products</option>' + ledgerProductOptions(f.productId) + '</select></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>By</label><select onchange="App.actions.ledgerFilterUser(this.value)">' +
+    '<option value="all">Everyone</option>' + ledgerUserOptions(f.user==='all'?'':f.user) + '</select></div>' +
+    '<div class="field" style="margin-bottom:0;flex:1;min-width:180px;"><label>Search</label>' +
+    '<input id="ledgerSearchBox" placeholder="Product / challan / reason\u2026" value="'+escapeHtml(f.q||'')+'" oninput="App.actions.ledgerSearch(this.value)"></div>' +
+    '<button class="btn btn-ghost btn-sm" onclick="App.actions.ledgerFilterReset()">Reset filters</button>' +
     '<button class="btn btn-ghost btn-sm" onclick="App.actions.exportLedgerCSV()">Export CSV</button>' +
     '</div>';
 
   if(!rows.length){
-    html += emptyState('No ledger entries', 'Every refill, pack, loose-return, and dispatch movement will show up here.', '', '');
+    html += emptyState('No matching ledger entries', 'Try widening your filters, or clear them with Reset.', '', '');
     return html;
   }
+  html += '<div class="hint" style="margin:-6px 0 10px;">'+rows.length+' entr'+(rows.length===1?'y':'ies')+'</div>';
   html += ledgerTable(rows);
   return html;
 }
@@ -1583,11 +1583,6 @@ App.actions.refillSubmitSheet = async function(){
   if(!f.date) return toast('Select a date', 'err');
   const validLines = f.lines.filter(lineValid);
   if(!validLines.length) return toast('Add at least one valid line item', 'err');
-
-  const dup = findRecentDuplicateSheet(App.state.materialInSheets, f.date, f.sheetTitle, validLines);
-  if(dup && !confirm('A sheet with the exact same date, title and items was already saved '+timeAgo(dup.createdAt)+' as Challan '+dup.challanNo+'. Submit this one anyway?')){
-    return;
-  }
 
   const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
 
@@ -2216,6 +2211,12 @@ App.actions.dispatchVoidSheet = async function(sheetId){
 
 /* ---- ledger / report filters & export ---- */
 App.actions.ledgerFilterArea = function(val){ App.ui.ledgerFilter.area = val; render(); };
+App.actions.ledgerFilterDepartment = function(val){ App.ui.ledgerFilter.department = val; render(); };
+App.actions.ledgerFilterProduct = function(val){ App.ui.ledgerFilter.productId = val; render(); };
+App.actions.ledgerFilterUser = function(val){ App.ui.ledgerFilter.user = val; render(); };
+App.actions.ledgerFilterFrom = function(val){ App.ui.ledgerFilter.from = val; render(); };
+App.actions.ledgerFilterTo = function(val){ App.ui.ledgerFilter.to = val; render(); };
+App.actions.ledgerFilterReset = function(){ App.ui.ledgerFilter = {area:'all', department:'all', productId:'', user:'all', from:'', to:'', q:''}; render(); };
 App.actions.ledgerSearch = function(val){ App.ui.ledgerFilter.q = val; render(); };
 App.actions.reportSetFrom = function(val){ App.ui.reportFilter.from = val; render(); };
 App.actions.reportSetTo = function(val){ App.ui.reportFilter.to = val; render(); };
@@ -2228,20 +2229,13 @@ function downloadBlob(content, mime, filename){
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
-// Guards against CSV/formula injection: a cell starting with =, +, -, or @
-// is interpreted as a formula by Excel/Sheets when the file is opened, so
-// prefix it with a leading quote to force it to be read as plain text.
-function csvCell(v){
-  let s = String(v==null?'':v);
-  if(/^[=+\-@]/.test(s)) s = "'"+s;
-  return '"'+s.replace(/"/g,'""')+'"';
-}
 App.actions.exportLedgerCSV = function(){
-  const rows = [['When','Area','Product','Change','Balance','Reason','Challan','By']];
-  App.state.ledger.slice().sort(function(a,b){return a.ts-b.ts;}).forEach(function(r){
-    rows.push([fmtDateTime(r.ts), r.area, productNameForArea(r.area, r.productId), r.delta, r.balanceAfter, r.reason, r.challanNo, r.user]);
+  const txnTypeMap = ledgerTxnTypeMap();
+  const rows = [['When','Department','Area','Product','Change','Balance','Reason','Challan','By']];
+  filteredLedgerRows().slice().sort(function(a,b){return a.ts-b.ts;}).forEach(function(r){
+    rows.push([fmtDateTime(r.ts), LEDGER_DEPARTMENT_LABELS[ledgerRowDepartment(r, txnTypeMap)], r.area, productNameForArea(r.area, r.productId), r.delta, r.balanceAfter, r.reason, r.challanNo, r.user]);
   });
-  const csv = rows.map(function(r){return r.map(csvCell).join(',');}).join('\n');
+  const csv = rows.map(function(r){return r.map(function(c){return '"'+String(c).replace(/"/g,'""')+'"';}).join(',');}).join('\n');
   downloadBlob(csv, 'text/csv', 'packing-ledger.csv');
 };
 App.actions.exportDispatchCSV = function(){
@@ -2249,7 +2243,7 @@ App.actions.exportDispatchCSV = function(){
   App.state.transactions.filter(function(t){return t.type==='dispatch';}).sort(function(a,b){return a.ts-b.ts;}).forEach(function(t){
     rows.push([fmtDate(t.ts), t.challanNo, finishedProductName(t.productId), t.qty, t.destination||'', t.note||'', t.voided?'Yes':'No']);
   });
-  const csv = rows.map(function(r){return r.map(csvCell).join(',');}).join('\n');
+  const csv = rows.map(function(r){return r.map(function(c){return '"'+String(c).replace(/"/g,'""')+'"';}).join(',');}).join('\n');
   downloadBlob(csv, 'text/csv', 'dispatch-report.csv');
 };
 

@@ -364,14 +364,38 @@ const TXN_LABELS = {
   dispatch:'Dispatched'
 };
 
+const CHALLAN_PREFIX = { refill:'MI', pack:'PK', loose:'LR', dispatch:'DC' };
+function formatChallan(type, n){
+  return CHALLAN_PREFIX[type] + '-' + String(n).padStart(4,'0');
+}
+// Atomically claims the next challan number for a type, inside an
+// already-open Firestore transaction. Must be called during the READ
+// phase (before any transaction.set/update/delete in that transaction),
+// since it performs a transaction.get(). The caller is responsible for
+// writing the returned counterRef/nextNum back with transaction.set()
+// during the write phase -- this only computes the value, it doesn't
+// persist it, so two concurrent transactions can never claim the same
+// number (Firestore's transaction retry-on-conflict guarantees that).
+async function claimChallanNumber(transaction, type){
+  const counterRef = doc(db,'counters',type);
+  const snap = await transaction.get(counterRef);
+  const nextNum = (snap.exists() ? snap.data().last : 0) + 1;
+  return { counterRef: counterRef, nextNum: nextNum, challanNo: formatChallan(type, nextNum) };
+}
+
 function defaultState(){
   return {
     meta:{ currentUser:'Operator', editWindowHours:24, companyName:'Royal Plastic' },
-    products:[],          // {id, name, cartonSize, pcsPerBag, createdAt}
-    stock:{},              // productId -> {refill, finished, loose}
+    rawMaterials:[],        // {id, name, pcsPerBag, createdAt} -- raw refill material, e.g. "Premium 16\""
+    finishedProducts:[],    // {id, name, cartonSize, rawMaterialId, createdAt} -- packed output made from a raw material, e.g. "Premium 16\" Packed Refill"
+    stock:{},               // rawMaterialId -> {refill, loose}
+    finishedStock:{},       // finishedProductId -> {finished}
     transactions:[],       // full transaction records, voidable
     ledger:[],              // flattened lines for display: {id, txnId, ts, productId, area, delta, balanceAfter, reason, challanNo, user}
-    materialInSheets:[]     // multi-line Material-In challans: {id, date, challanNo, sheetTitle, receivedBy, verifiedBy, lines:[...], txnIds:[...], voided, editableUntil, createdAt}
+    materialInSheets:[],    // {id, date, challanNo, sheetTitle, receivedBy, verifiedBy, lines:[...], txnIds:[...], voided, editableUntil, createdAt}
+    packingSheets:[],       // {id, date, challanNo, lines:[{rawMaterialId,finishedProductId,qty,cartonsProduced,looseProduced}], txnIds:[...], voided, editableUntil, createdAt}
+    looseReturnSheets:[],   // {id, date, challanNo, lines:[{productId,qty}], txnIds:[...], voided, editableUntil, createdAt}
+    dispatchSheets:[]       // {id, date, challanNo, destination, note, lines:[{productId,qty}], txnIds:[...], voided, editableUntil, createdAt}
   };
 }
 
@@ -380,11 +404,20 @@ const App = {
   ui:{
     ready:false,
     connectionError:null,
+    busy:false, // true while a sheet save/void is in flight -- blocks re-submission
     tab:'dashboard',
     refillMode:'list', // 'list' | 'new' | 'view'
     refillSheetForm:null,
-    viewingSheetId:null,
-    pack:{productId:'', qty:'', challanNo:'', note:''},
+    viewingRefillSheetId:null,
+    packMode:'list',
+    packSheetForm:null,
+    viewingPackSheetId:null,
+    looseMode:'list',
+    looseSheetForm:null,
+    viewingLooseSheetId:null,
+    dispatchMode:'list',
+    dispatchSheetForm:null,
+    viewingDispatchSheetId:null,
     ledgerFilter:{area:'all', q:''},
     reportFilter:{from:'', to:''}
   },
@@ -404,7 +437,7 @@ const db = getFirestore(firebaseApp);
 try{ enableIndexedDbPersistence(db); }catch(e){ /* multiple tabs open, or unsupported browser -- fine, just skip offline cache */ }
 
 function attachListeners(){
-  const flags = {products:false, stock:false, transactions:false, materialInSheets:false, ledger:false, meta:false};
+  const flags = {rawMaterials:false, finishedProducts:false, stock:false, finishedStock:false, transactions:false, materialInSheets:false, packingSheets:false, looseReturnSheets:false, dispatchSheets:false, ledger:false, meta:false};
   function checkReady(){
     if(!App.ui.ready && Object.keys(flags).every(function(k){return flags[k];})){
       App.ui.ready = true;
@@ -412,9 +445,14 @@ function attachListeners(){
     render();
   }
 
-  onSnapshot(collection(db,'products'), function(snap){
-    App.state.products = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
-    flags.products = true; checkReady();
+  onSnapshot(collection(db,'rawMaterials'), function(snap){
+    App.state.rawMaterials = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
+    flags.rawMaterials = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(collection(db,'finishedProducts'), function(snap){
+    App.state.finishedProducts = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
+    flags.finishedProducts = true; checkReady();
   }, function(err){ App.ui.connectionError = err.message; render(); });
 
   onSnapshot(collection(db,'stock'), function(snap){
@@ -422,6 +460,13 @@ function attachListeners(){
     snap.docs.forEach(function(d){ s[d.id] = d.data(); });
     App.state.stock = s;
     flags.stock = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(collection(db,'finishedStock'), function(snap){
+    const s = {};
+    snap.docs.forEach(function(d){ s[d.id] = d.data(); });
+    App.state.finishedStock = s;
+    flags.finishedStock = true; checkReady();
   }, function(err){ App.ui.connectionError = err.message; render(); });
 
   onSnapshot(collection(db,'transactions'), function(snap){
@@ -432,6 +477,21 @@ function attachListeners(){
   onSnapshot(collection(db,'materialInSheets'), function(snap){
     App.state.materialInSheets = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
     flags.materialInSheets = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(collection(db,'packingSheets'), function(snap){
+    App.state.packingSheets = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
+    flags.packingSheets = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(collection(db,'looseReturnSheets'), function(snap){
+    App.state.looseReturnSheets = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
+    flags.looseReturnSheets = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(collection(db,'dispatchSheets'), function(snap){
+    App.state.dispatchSheets = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
+    flags.dispatchSheets = true; checkReady();
   }, function(err){ App.ui.connectionError = err.message; render(); });
 
   onSnapshot(collection(db,'ledger'), function(snap){
@@ -470,22 +530,48 @@ function timeAgo(ts){
   if(s<86400) return Math.floor(s/3600)+'h ago';
   return Math.floor(s/86400)+'d ago';
 }
-function productName(id){
-  const p = App.state.products.find(x=>x.id===id);
+function rawMaterialName(id){
+  const p = App.state.rawMaterials.find(x=>x.id===id);
   return p ? p.name : '\u2014';
 }
-function productCartonSize(id){
-  const p = App.state.products.find(x=>x.id===id);
+function finishedProductName(id){
+  const p = App.state.finishedProducts.find(x=>x.id===id);
+  return p ? p.name : '\u2014';
+}
+// Ledger/transaction rows only store one productId, but which catalog it
+// points into depends on the area: refill/loose live in raw materials,
+// finished lives in finished products.
+function productNameForArea(area, id){
+  return area==='finished' ? finishedProductName(id) : rawMaterialName(id);
+}
+function finishedProductCartonSize(id){
+  const p = App.state.finishedProducts.find(x=>x.id===id);
   return p ? (p.cartonSize||1) : 1;
 }
-function stockFor(productId){
+function finishedProductsFor(rawMaterialId){
+  return App.state.finishedProducts.filter(function(p){return p.rawMaterialId===rawMaterialId;});
+}
+function rawStockFor(rawMaterialId){
   // Read-only: App.state.stock is a live cache fed by a Firestore listener,
   // so this must never write into it -- just return a safe default when
   // a stock doc hasn't been created yet (or hasn't synced down).
-  return App.state.stock[productId] || {refill:0, finished:0, loose:0};
+  return App.state.stock[rawMaterialId] || {refill:0, loose:0};
+}
+function finishedStockFor(finishedProductId){
+  return App.state.finishedStock[finishedProductId] || {finished:0};
 }
 function findSheetByTxnId(txnId){
-  return App.state.materialInSheets.find(function(s){return s.txnIds && s.txnIds.indexOf(txnId)!==-1;});
+  const sources = [
+    {kind:'refill', list: App.state.materialInSheets},
+    {kind:'pack', list: App.state.packingSheets},
+    {kind:'loose', list: App.state.looseReturnSheets},
+    {kind:'dispatch', list: App.state.dispatchSheets}
+  ];
+  for(const src of sources){
+    const sheet = src.list.find(function(s){return s.txnIds && s.txnIds.indexOf(txnId)!==-1;});
+    if(sheet) return {kind: src.kind, sheet: sheet};
+  }
+  return null;
 }
 function toast(msg, kind){
   const root = document.getElementById('toastRoot');
@@ -511,16 +597,6 @@ function emptyState(title, msg, ctaLabel, ctaFn){
   return '<div class="empty"><div class="disp">'+escapeHtml(title)+'</div><p>'+escapeHtml(msg)+'</p>' +
     (ctaFn?'<button class="btn btn-primary btn-sm" onclick="'+ctaFn+'">'+escapeHtml(ctaLabel)+'</button>':'') + '</div>';
 }
-function productOptions(selectedId){
-  return App.state.products.map(function(p){
-    return '<option value="'+p.id+'"'+(selectedId===p.id?' selected':'')+'>'+escapeHtml(p.name)+' ('+p.cartonSize+'/carton)</option>';
-  }).join('');
-}
-function challanAlreadyUsed(type, challanNo){
-  return App.state.transactions.some(function(t){
-    return t.type===type && !t.voided && t.challanNo.toLowerCase()===challanNo.toLowerCase();
-  });
-}
 function todayISO(){
   const d = new Date();
   const off = d.getTimezoneOffset();
@@ -531,12 +607,16 @@ function newEmptyLine(){
 }
 function newSheetForm(){
   return {
-    date: todayISO(), challanNo:'',
+    date: todayISO(),
     sheetTitle: App.state.meta.lastSheetTitle || '',
     receivedBy: App.state.meta.currentUser || '',
     verifiedBy: '',
     lines: [newEmptyLine()]
   };
+}
+function linePcsPerBag(line){
+  if(line.mode==='mix') return (Number(line.qtyA)||0) + (Number(line.qtyB)||0);
+  return Number(line.pcsPerBag)||0;
 }
 function lineTotal(line){
   if(line.mode==='mix'){
@@ -545,15 +625,11 @@ function lineTotal(line){
   }
   return (Number(line.pcsPerBag)||0) * (Number(line.bags)||0);
 }
-function linePcsPerBag(line){
-  if(line.mode==='mix') return (Number(line.qtyA)||0) + (Number(line.qtyB)||0);
-  return Number(line.pcsPerBag)||0;
-}
 function lineLabel(line){
   if(line.mode==='mix'){
-    return escapeHtml(productName(line.productId))+' ('+(Number(line.qtyA)||0)+') '+escapeHtml(productName(line.productIdB))+' ('+(Number(line.qtyB)||0)+') \u2014 Mix';
+    return escapeHtml(rawMaterialName(line.productId))+' ('+(Number(line.qtyA)||0)+') '+escapeHtml(rawMaterialName(line.productIdB))+' ('+(Number(line.qtyB)||0)+') \u2014 Mix';
   }
-  return escapeHtml(productName(line.productId));
+  return escapeHtml(rawMaterialName(line.productId));
 }
 function lineValid(line){
   if(line.mode==='mix'){
@@ -561,6 +637,30 @@ function lineValid(line){
       (Number(line.qtyA)>0 || Number(line.qtyB)>0) && Number(line.bags)>0;
   }
   return line.productId && Number(line.pcsPerBag)>0 && Number(line.bags)>0;
+}
+
+// Guards against accidentally saving the same paper sheet twice (the same
+// date/title/line-items submitted minutes apart) -- catches both fumbled
+// double entry and a resubmit-after-a-flaky-network-error, since either one
+// silently doubles stock without changing any total that looks "off" at a
+// glance (every affected material scales by the same factor).
+const DUPLICATE_SHEET_WINDOW_MS = 15 * 60 * 1000;
+function normalizeLines(lines){
+  return JSON.stringify((lines||[]).map(function(l){
+    return {
+      mode: l.mode||'single', productId: l.productId||'', productIdB: l.productIdB||'',
+      pcsPerBag: Number(l.pcsPerBag)||0, bags: Number(l.bags)||0,
+      qtyA: Number(l.qtyA)||0, qtyB: Number(l.qtyB)||0
+    };
+  }));
+}
+function findRecentDuplicateSheet(list, date, sheetTitle, lines){
+  const key = normalizeLines(lines);
+  const cutoff = Date.now() - DUPLICATE_SHEET_WINDOW_MS;
+  return list.find(function(s){
+    return !s.voided && s.date===date && (s.sheetTitle||'')===(sheetTitle||'') &&
+      s.createdAt>=cutoff && normalizeLines(s.lines)===key;
+  });
 }
 
 /* ---------------- pure data builders (no side effects -- used inside Firestore transactions) ---------------- */
@@ -674,53 +774,71 @@ function render(){
 }
 
 /* ================= DASHBOARD ================= */
+function productNameForTxn(t){
+  return (t.type==='refill_in' || t.type==='loose_return') ? rawMaterialName(t.productId) : finishedProductName(t.productId);
+}
 function viewDashboard(){
   const s = App.state;
   let totalRefill=0, totalLoose=0, totalFinished=0;
-  s.products.forEach(function(p){
-    const st = stockFor(p.id);
-    totalRefill += st.refill; totalLoose += st.loose; totalFinished += st.finished;
+  s.rawMaterials.forEach(function(p){
+    const st = rawStockFor(p.id);
+    totalRefill += st.refill; totalLoose += st.loose;
+  });
+  s.finishedProducts.forEach(function(p){
+    totalFinished += finishedStockFor(p.id).finished;
   });
   const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-  const dispatchesToday = s.transactions.filter(function(t){return t.type==='dispatch' && !t.voided && t.ts>=todayStart.getTime();}).length;
+  const dispatchesToday = new Set(
+    s.transactions.filter(function(t){return t.type==='dispatch' && !t.voided && t.ts>=todayStart.getTime();})
+      .map(function(t){return t.challanNo;})
+  ).size;
 
   let html = '<div class="grid grid-stats">' +
-    statCard('Refill stock on hand', totalRefill+' pcs', s.products.length+' product(s)', '') +
+    statCard('Raw material on hand', totalRefill+' pcs', s.rawMaterials.length+' raw material(s)', '') +
     statCard('Loose pieces pending', totalLoose+' pcs', totalLoose>0?'awaiting return or top-up':'none pending', totalLoose>0?'warn':'good') +
-    statCard('Finished goods ready', totalFinished+' cartons', 'ready to dispatch', 'good') +
+    statCard('Finished goods ready', totalFinished+' cartons', s.finishedProducts.length+' finished product(s)', 'good') +
     statCard('Dispatches today', dispatchesToday, 'challans issued', '') +
   '</div>';
 
-  if(!s.products.length){
-    html += emptyState('No products set up yet', 'Add your first mop refill product in Settings to get started.', 'Go to Settings', "App.actions.nav('settings')");
+  if(!s.rawMaterials.length && !s.finishedProducts.length){
+    html += emptyState('No products set up yet', 'Add your raw materials and finished products in Settings to get started.', 'Go to Settings', "App.actions.nav('settings')");
     return html;
   }
 
-  html += '<div class="section-head"><h2>Stock by product</h2></div>' +
-    '<div class="tbl-wrap"><table><thead><tr><th>Product</th><th>Carton size</th><th>Refill</th><th>Loose</th><th>Finished (cartons)</th></tr></thead><tbody>' +
-    s.products.map(function(p){
-      const st = stockFor(p.id);
-      return '<tr><td>'+escapeHtml(p.name)+'</td><td class="mono">'+p.cartonSize+'</td>' +
-        '<td class="mono">'+st.refill+'</td><td class="mono">'+st.loose+'</td><td class="mono">'+st.finished+'</td></tr>';
-    }).join('') + '</tbody></table></div>';
+  html += '<div class="section-head"><h2>Raw materials</h2></div>';
+  if(!s.rawMaterials.length){
+    html += emptyState('No raw materials yet', 'Add a raw material in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
+  } else {
+    html += '<div class="tbl-wrap" style="margin-bottom:24px;"><table><thead><tr><th>Raw material</th><th>Refill</th><th>Loose</th></tr></thead><tbody>' +
+      s.rawMaterials.map(function(p){
+        const st = rawStockFor(p.id);
+        return '<tr><td>'+escapeHtml(p.name)+'</td><td class="mono">'+st.refill+'</td><td class="mono">'+st.loose+'</td></tr>';
+      }).join('') + '</tbody></table></div>';
+  }
+
+  html += '<div class="section-head"><h2>Finished products</h2></div>';
+  if(!s.finishedProducts.length){
+    html += emptyState('No finished products yet', 'Add a finished product in Settings first (packed from a raw material).', 'Go to Settings', "App.actions.nav('settings')");
+  } else {
+    html += '<div class="tbl-wrap" style="margin-bottom:24px;"><table><thead><tr><th>Finished product</th><th>Made from</th><th>Carton size</th><th>Finished (cartons)</th></tr></thead><tbody>' +
+      s.finishedProducts.map(function(p){
+        return '<tr><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(rawMaterialName(p.rawMaterialId))+'</td><td class="mono">'+p.cartonSize+'</td>' +
+          '<td class="mono">'+finishedStockFor(p.id).finished+'</td></tr>';
+      }).join('') + '</tbody></table></div>';
+  }
 
   const recent = s.transactions.slice().sort(function(a,b){return b.ts-a.ts;}).slice(0,10);
   html += '<div class="section-head"><h2>Recent activity</h2></div>';
   if(!recent.length){
     html += emptyState('No activity yet', 'Receive some refill stock to get started.', 'Receive stock', "App.actions.nav('refill')");
   } else {
+    const viewActionByKind = {refill:'refillViewSheet', pack:'packViewSheet', loose:'looseViewSheet', dispatch:'dispatchViewSheet'};
     html += '<div class="tbl-wrap"><table><thead><tr><th>Type</th><th>Product</th><th>Challan</th><th>When</th><th>By</th><th></th></tr></thead><tbody>' +
       recent.map(function(t){
-        const voidable = !t.voided && Date.now() < t.editableUntil;
-        let actionCell = '';
-        if(t.type==='refill_in'){
-          const sheet = findSheetByTxnId(t.id);
-          actionCell = sheet ? '<button class="btn btn-ghost btn-sm" onclick="App.actions.refillViewSheet(\''+sheet.id+'\')">View sheet</button>' : '';
-        } else if(voidable){
-          actionCell = '<button class="btn btn-ghost btn-sm" onclick="App.actions.voidTxn(\''+t.id+'\')">Void</button>';
-        }
+        const found = findSheetByTxnId(t.id);
+        const actionCell = found ? '<button class="btn btn-ghost btn-sm" onclick="App.actions.'+viewActionByKind[found.kind]+'(\''+found.sheet.id+'\')">View sheet</button>' : '';
         return '<tr><td>'+TXN_LABELS[t.type]+(t.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
-          '<td>'+escapeHtml(productName(t.productId))+'</td>' +
+          '<td>'+escapeHtml(productNameForTxn(t))+'</td>' +
           '<td>'+tag(t.challanNo)+'</td>' +
           '<td>'+timeAgo(t.ts)+'</td>' +
           '<td>'+escapeHtml(t.user)+'</td>' +
@@ -731,55 +849,56 @@ function viewDashboard(){
 }
 
 /* ================= REFILL STOCK (Material-In Sheets) ================= */
-function productOptionsPlain(selectedId){
-  return App.state.products.map(function(p){
+function rawMaterialOptionsPlain(selectedId){
+  return App.state.rawMaterials.map(function(p){
     return '<option value="'+p.id+'"'+(selectedId===p.id?' selected':'')+'>'+escapeHtml(p.name)+'</option>';
   }).join('');
 }
-function renderLineRow(line, i){
+function renderLineTableRow(line, i){
   const total = lineTotal(line);
-  const pcsPerBag = linePcsPerBag(line);
-  let fields = '';
+  let itemCell, pcsCell;
   if(line.mode==='single'){
-    fields =
-      '<div class="field" style="margin-bottom:0;"><label>Product</label><select onchange="App.actions.refillLineSetField('+i+',\'productId\',this.value)">' +
-      '<option value="">Select\u2026</option>' + productOptionsPlain(line.productId) + '</select></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>PCS/Bag</label><input id="line_'+i+'_pcsPerBag" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.pcsPerBag)+'" oninput="App.actions.refillLineSetField('+i+',\'pcsPerBag\',this.value)"></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Bags</label><input id="line_'+i+'_bags" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></div>';
+    itemCell =
+      '<select style="width:100%;" onchange="App.actions.refillLineSetField('+i+',\'productId\',this.value)">' +
+      '<option value="">Select raw material\u2026</option>' + rawMaterialOptionsPlain(line.productId) + '</select>' +
+      '<button class="btn btn-ghost btn-sm" style="margin-top:5px;padding:2px 8px;font-size:11px;" onclick="App.actions.refillLineSetMode('+i+',\'mix\')">+ mix with another product</button>';
+    pcsCell = '<input id="line_'+i+'_pcsPerBag" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" style="width:100%;" placeholder="pcs/bag" value="'+escapeHtml(line.pcsPerBag)+'" oninput="App.actions.refillLineSetField('+i+',\'pcsPerBag\',this.value)">';
   } else {
-    fields =
-      '<div class="field" style="margin-bottom:0;"><label>Product A</label><select onchange="App.actions.refillLineSetField('+i+',\'productId\',this.value)">' +
-      '<option value="">Select\u2026</option>' + productOptionsPlain(line.productId) + '</select></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Qty A / bag</label><input id="line_'+i+'_qtyA" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qtyA)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyA\',this.value)"></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Product B</label><select onchange="App.actions.refillLineSetField('+i+',\'productIdB\',this.value)">' +
-      '<option value="">Select\u2026</option>' + productOptionsPlain(line.productIdB) + '</select></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Qty B / bag</label><input id="line_'+i+'_qtyB" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qtyB)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyB\',this.value)"></div>' +
-      '<div class="field" style="margin-bottom:0;"><label>Bags</label><input id="line_'+i+'_bags" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></div>';
+    itemCell =
+      '<select style="width:100%;" onchange="App.actions.refillLineSetField('+i+',\'productId\',this.value)">' +
+      '<option value="">Product A\u2026</option>' + rawMaterialOptionsPlain(line.productId) + '</select>' +
+      '<div style="margin:3px 0;font-size:11px;color:var(--ink-soft);">mixed with</div>' +
+      '<select style="width:100%;" onchange="App.actions.refillLineSetField('+i+',\'productIdB\',this.value)">' +
+      '<option value="">Product B\u2026</option>' + rawMaterialOptionsPlain(line.productIdB) + '</select>' +
+      '<button class="btn btn-ghost btn-sm" style="margin-top:5px;padding:2px 8px;font-size:11px;" onclick="App.actions.refillLineSetMode('+i+',\'single\')">&times; remove mix</button>';
+    pcsCell =
+      '<div style="display:flex;gap:4px;align-items:center;">' +
+      '<input id="line_'+i+'_qtyA" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" style="width:100%;" placeholder="A" value="'+escapeHtml(line.qtyA)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyA\',this.value)">' +
+      '<span style="font-size:11px;color:var(--ink-soft);">+</span>' +
+      '<input id="line_'+i+'_qtyB" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" style="width:100%;" placeholder="B" value="'+escapeHtml(line.qtyB)+'" oninput="App.actions.refillLineSetField('+i+',\'qtyB\',this.value)">' +
+      '</div>';
   }
-  return '<div class="card" style="margin-bottom:10px;">' +
-    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
-    '<div style="display:flex;gap:6px;">' +
-    '<button class="btn btn-sm '+(line.mode==='single'?'btn-primary':'btn-ghost')+'" onclick="App.actions.refillLineSetMode('+i+',\'single\')">Single</button>' +
-    '<button class="btn btn-sm '+(line.mode==='mix'?'btn-primary':'btn-ghost')+'" onclick="App.actions.refillLineSetMode('+i+',\'mix\')">Mix</button>' +
-    '</div>' +
-    '<button class="row-x" onclick="App.actions.refillRemoveLine('+i+')" title="Remove line">&times;</button>' +
-    '</div>' +
-    '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;">' + fields + '</div>' +
-    (pcsPerBag>0 && Number(line.bags)>0 ? '<div class="hint" style="margin-top:10px;">= <strong>'+total+'</strong> total pieces ('+pcsPerBag+' pcs/bag \u00d7 '+line.bags+' bags)</div>' : '') +
-    '</div>';
+  return '<tr>' +
+    '<td class="mono">'+(i+1)+'</td>' +
+    '<td style="min-width:180px;">'+itemCell+'</td>' +
+    '<td style="min-width:110px;">'+pcsCell+'</td>' +
+    '<td><input id="line_'+i+'_bags" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" style="width:64px;" value="'+escapeHtml(line.bags)+'" oninput="App.actions.refillLineSetField('+i+',\'bags\',this.value)"></td>' +
+    '<td class="mono">'+(total||'\u2014')+'</td>' +
+    '<td><button class="row-x" onclick="App.actions.refillRemoveLine('+i+')" title="Remove row">&times;</button></td>' +
+    '</tr>';
 }
 function viewRefillList(){
   const s = App.state;
-  let html = '<div class="section-head"><h2>Refill stock</h2>' +
+  let html = '<div class="section-head"><h2>Refill stock (raw material)</h2>' +
     '<button class="btn btn-primary" onclick="App.actions.refillNewSheet()">+ New material-in sheet (Step 1)</button></div>';
 
-  if(!s.products.length){
-    return html + emptyState('No products yet', 'Add a mop refill product in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
+  if(!s.rawMaterials.length){
+    return html + emptyState('No raw materials yet', 'Add a raw material in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
   }
 
-  html += '<div class="tbl-wrap" style="margin-bottom:24px;"><table><thead><tr><th>Product</th><th>Refill balance</th></tr></thead><tbody>' +
-    s.products.map(function(p){
-      return '<tr><td>'+escapeHtml(p.name)+'</td><td class="mono">'+stockFor(p.id).refill+' pcs</td></tr>';
+  html += '<div class="tbl-wrap" style="margin-bottom:24px;"><table><thead><tr><th>Raw material</th><th>Refill balance</th></tr></thead><tbody>' +
+    s.rawMaterials.map(function(p){
+      return '<tr><td>'+escapeHtml(p.name)+'</td><td class="mono">'+rawStockFor(p.id).refill+' pcs</td></tr>';
     }).join('') + '</tbody></table></div>';
 
   const sheets = s.materialInSheets.slice().sort(function(a,b){return b.createdAt-a.createdAt;});
@@ -800,8 +919,8 @@ function viewRefillList(){
 function viewRefillNewSheet(){
   const s = App.state;
   const f = App.ui.refillSheetForm;
-  if(!s.products.length){
-    return emptyState('No products yet', 'Add a mop refill product in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
+  if(!s.rawMaterials.length){
+    return emptyState('No raw materials yet', 'Add a raw material in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
   }
   const grandTotal = f.lines.reduce(function(sum,l){return sum+lineTotal(l);},0);
 
@@ -809,10 +928,8 @@ function viewRefillNewSheet(){
     '<button class="btn btn-ghost btn-sm" onclick="App.actions.refillCancelNew()">Cancel</button></div>';
 
   html += '<div class="card" style="margin-bottom:16px;">' +
-    '<div class="field-row">' +
-    '<div class="field"><label>Date</label><input id="sheetDate" type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.refillSheetSetField(\'date\',this.value)"></div>' +
-    '<div class="field"><label>Challan no.</label><input id="sheetChallanNo" class="mono" value="'+escapeHtml(f.challanNo)+'" oninput="App.actions.refillSheetSetField(\'challanNo\',this.value)" placeholder="e.g. CH-0101"></div>' +
-    '</div>' +
+    '<div class="field" style="max-width:220px;"><label>Date</label><input id="sheetDate" type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.refillSheetSetField(\'date\',this.value)"></div>' +
+    '<div class="hint" style="margin:-8px 0 13px;">Challan number is assigned automatically when you save.</div>' +
     '<div class="field"><label>Sheet title (optional)</label><input id="sheetTitle" value="'+escapeHtml(f.sheetTitle)+'" oninput="App.actions.refillSheetSetField(\'sheetTitle\',this.value)" placeholder="e.g. Zedello Mop Refil Stock"></div>' +
     '<div class="field-row">' +
     '<div class="field"><label>Received by</label><input id="sheetReceivedBy" value="'+escapeHtml(f.receivedBy)+'" oninput="App.actions.refillSheetSetField(\'receivedBy\',this.value)"></div>' +
@@ -821,11 +938,16 @@ function viewRefillNewSheet(){
     '</div>';
 
   html += '<label style="display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Line items</label>';
-  html += f.lines.map(function(l,i){return renderLineRow(l,i);}).join('');
-  html += '<button class="btn btn-ghost btn-sm" onclick="App.actions.refillAddLine()">+ Add line</button>';
+  html += '<div class="tbl-wrap" style="margin-bottom:10px;"><table><thead><tr>' +
+    '<th>S.No</th><th>Item Name</th><th>PCS/BAG</th><th>Bags</th><th>Total Pieces</th><th></th>' +
+    '</tr></thead><tbody>' +
+    f.lines.map(function(l,i){return renderLineTableRow(l,i);}).join('') +
+    '</tbody></table></div>';
+  html += '<div class="hint" style="margin:-2px 0 10px;">Same item with a different pcs/bag this batch? Add another row for it.</div>';
+  html += '<button class="btn btn-ghost btn-sm" onclick="App.actions.refillAddLine()">+ Add row</button>';
 
   html += '<div class="preview-box" style="margin-top:16px;">Grand total: <strong>'+grandTotal+'</strong> pieces across '+f.lines.length+' line(s)</div>';
-  html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:6px;" onclick="App.actions.refillSubmitSheet()">Save sheet &amp; update stock</button>';
+  html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:6px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.refillSubmitSheet()">'+(App.ui.busy?'Saving\u2026':'Save sheet &amp; update stock')+'</button>';
   return html;
 }
 function viewRefillSheetDetail(sheetId){
@@ -845,7 +967,7 @@ function viewRefillSheetDetail(sheetId){
     (sh.sheetTitle?'<div class="eyebrow" style="margin-top:4px;">'+escapeHtml(sh.sheetTitle)+'</div>':'') + '</div>' +
     '<div style="margin:16px 0 10px;font-size:13px;">Date: <strong>'+escapeHtml(sh.date)+'</strong> &nbsp;\u00b7&nbsp; Challan: <strong>'+escapeHtml(sh.challanNo)+'</strong>' +
     (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + '</div>' +
-    '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Item name</th><th>PCS/Bag</th><th>Bags</th><th>Total pieces</th></tr></thead><tbody>' +
+    '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Item Name</th><th>PCS/BAG</th><th>Bags</th><th>Total Pieces</th></tr></thead><tbody>' +
     sh.lines.map(function(l,i){
       return '<tr><td>'+(i+1)+'</td><td>'+lineLabel(l)+'</td><td class="mono">'+linePcsPerBag(l)+'</td><td class="mono">'+l.bags+'</td><td class="mono">'+lineTotal(l)+'</td></tr>';
     }).join('') + '</tbody></table></div>' +
@@ -858,101 +980,310 @@ function viewRefillSheetDetail(sheetId){
 }
 function viewRefill(){
   if(App.ui.refillMode==='new') return viewRefillNewSheet();
-  if(App.ui.refillMode==='view') return viewRefillSheetDetail(App.ui.viewingSheetId);
+  if(App.ui.refillMode==='view') return viewRefillSheetDetail(App.ui.viewingRefillSheetId);
   return viewRefillList();
 }
 
 /* ================= PACK A BATCH ================= */
-function viewPack(){
-  const s = App.state;
-  const d = App.ui.pack;
-  if(!s.products.length){
-    return emptyState('No products yet', 'Add a mop refill product in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
+/* ================= PACK A BATCH (multi-line sheet) ================= */
+function newPackSheetForm(){
+  return { date: todayISO(), lines: [{finishedProductId:'', qty:''}] };
+}
+function finishedProductOptionsPlain(selectedId){
+  return App.state.finishedProducts.map(function(p){
+    return '<option value="'+p.id+'"'+(selectedId===p.id?' selected':'')+'>'+escapeHtml(p.name)+'</option>';
+  }).join('');
+}
+function packLineRawMaterialId(line){
+  const fp = App.state.finishedProducts.find(function(x){return x.id===line.finishedProductId;});
+  return fp ? fp.rawMaterialId : '';
+}
+function packLineCartonSize(line){
+  return line.finishedProductId ? finishedProductCartonSize(line.finishedProductId) : 0;
+}
+function packLineCartons(line){
+  const size = packLineCartonSize(line);
+  const qty = Number(line.qty)||0;
+  return size ? Math.floor(qty/size) : 0;
+}
+function packLineLoose(line){
+  const size = packLineCartonSize(line);
+  const qty = Number(line.qty)||0;
+  return size ? (qty % size) : 0;
+}
+function packLineReservedBySiblings(i){
+  const f = App.ui.packSheetForm;
+  const line = f.lines[i];
+  const rawId = packLineRawMaterialId(line);
+  if(!rawId) return 0;
+  let reserved = 0;
+  for(let j=0;j<i;j++){
+    if(packLineRawMaterialId(f.lines[j]) === rawId) reserved += Number(f.lines[j].qty)||0;
   }
-
-  const st = d.productId ? stockFor(d.productId) : null;
-  const cartonSize = d.productId ? productCartonSize(d.productId) : 0;
-  const qty = Number(d.qty)||0;
-  const cartons = cartonSize ? Math.floor(qty/cartonSize) : 0;
-  const loose = cartonSize ? (qty % cartonSize) : 0;
-
-  let html = '<div class="card" style="max-width:640px;">';
-  html += '<div class="field"><label>Product</label><select onchange="App.actions.packSetField(\'productId\',this.value)">' +
-    '<option value="">Select product\u2026</option>' + productOptions(d.productId) + '</select></div>';
-
-  if(d.productId){
-    html += '<div class="balance-hint">Refill balance: <strong style="margin-left:4px;">'+st.refill+' pcs</strong> \u00b7 carton size: '+cartonSize+' pcs</div>';
-    html += '<div class="field"><label>Quantity to pack (pieces)</label>' +
-      '<input id="packQty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(d.qty)+'" oninput="App.actions.packSetField(\'qty\',this.value)" placeholder="e.g. 240"></div>';
-
-    if(qty>0){
-      html += '<div class="preview-box">= <strong>'+cartons+'</strong> complete carton(s)' + (loose>0?' + <strong>'+loose+'</strong> loose piece(s)':' + 0 loose pieces') + '</div>';
+  return reserved;
+}
+function renderPackLineRow(line, i){
+  const rawId = packLineRawMaterialId(line);
+  const cartonSize = packLineCartonSize(line);
+  const qty = Number(line.qty)||0;
+  const rawBalance = rawId ? rawStockFor(rawId).refill : 0;
+  const reserved = line.finishedProductId ? packLineReservedBySiblings(i) : 0;
+  const availBalance = rawBalance - reserved;
+  let html = '<div class="card" style="margin-bottom:10px;">' +
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
+    '<div class="eyebrow">Line '+(i+1)+'</div>' +
+    '<button class="row-x" onclick="App.actions.packRemoveLine('+i+')" title="Remove line">&times;</button></div>' +
+    '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;">' +
+    '<div class="field" style="margin-bottom:0;"><label>Finished product</label><select onchange="App.actions.packLineSetField('+i+',\'finishedProductId\',this.value)">' +
+    '<option value="">Select\u2026</option>' + finishedProductOptionsPlain(line.finishedProductId) + '</select></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Quantity to pack (raw pcs)</label>' +
+    '<input id="packline_'+i+'_qty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.packLineSetField('+i+',\'qty\',this.value)"></div>' +
+    '</div>';
+  if(line.finishedProductId){
+    const short = qty > availBalance;
+    html += '<div class="hint" style="margin-top:8px;">Made from raw material: <strong>'+escapeHtml(rawMaterialName(rawId))+'</strong></div>';
+    html += '<div class="balance-hint" style="margin-top:6px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Refill balance: <strong style="margin-left:4px;">'+availBalance+' pcs</strong> \u00b7 carton size: '+cartonSize+' pcs'+(short?' \u2014 not enough stock':'')+'</div>';
+    if(reserved>0){
+      html += '<div class="hint" style="margin-top:4px;">'+rawBalance+' pcs in stock \u2014 '+reserved+' pcs already claimed by earlier line(s) using this raw material in this sheet</div>';
     }
-
-    html += '<div class="field"><label>Packing challan no.</label>' +
-      '<input id="packChallanNo" class="mono" value="'+escapeHtml(d.challanNo)+'" oninput="App.actions.packSetField(\'challanNo\',this.value)" placeholder="e.g. CH-0114"></div>';
-    html += '<div class="field"><label>Note (optional)</label>' +
-      '<textarea id="packNote" oninput="App.actions.packSetField(\'note\',this.value)" placeholder="Shift, line, remark">'+escapeHtml(d.note||'')+'</textarea></div>';
-
-    html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;" onclick="App.actions.packSubmit()">Confirm pack &amp; stamp</button>';
+    if(qty>0){
+      html += '<div class="hint" style="margin-top:6px;">= <strong>'+packLineCartons(line)+'</strong> carton(s) + <strong>'+packLineLoose(line)+'</strong> loose piece(s) \u2014 loose returns to '+escapeHtml(rawMaterialName(rawId))+' raw stock</div>';
+    }
   }
   html += '</div>';
-
-  const recent = s.transactions.filter(function(t){return t.type==='pack';}).sort(function(a,b){return b.ts-a.ts;}).slice(0,8);
-  if(recent.length){
-    html += '<div class="section-head"><h2>Recent packing runs</h2></div>' +
-      '<div class="tbl-wrap"><table><thead><tr><th>Challan</th><th>Product</th><th>Taken</th><th>Cartons</th><th>Loose</th><th>When</th><th></th></tr></thead><tbody>' +
-      recent.map(function(t){
-        const voidable = !t.voided && Date.now() < t.editableUntil;
-        return '<tr><td>'+tag(t.challanNo)+(t.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
-          '<td>'+escapeHtml(productName(t.productId))+'</td>' +
-          '<td class="mono">'+t.qtyTaken+'</td><td class="mono">'+t.cartonsProduced+'</td><td class="mono">'+t.looseProduced+'</td>' +
-          '<td>'+timeAgo(t.ts)+'</td>' +
-          '<td>'+(voidable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.voidTxn(\''+t.id+'\')">Void</button>':'')+'</td></tr>';
+  return html;
+}
+function viewPackList(){
+  const s = App.state;
+  let html = '<div class="section-head"><h2>Pack a batch</h2>' +
+    '<button class="btn btn-primary" onclick="App.actions.packNewSheet()">+ New packing sheet (Step 2)</button></div>';
+  if(!s.finishedProducts.length){
+    return html + emptyState('No finished products yet', 'Add a finished product in Settings first (packed from a raw material).', 'Go to Settings', "App.actions.nav('settings')");
+  }
+  const sheets = s.packingSheets.slice().sort(function(a,b){return b.createdAt-a.createdAt;});
+  if(!sheets.length){
+    html += emptyState('No packing sheets yet', 'Create your first packing sheet to convert refill stock into cartons.', 'New packing sheet', 'App.actions.packNewSheet()');
+  } else {
+    html += '<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Challan</th><th>Lines</th><th>Cartons</th><th>Loose</th><th></th></tr></thead><tbody>' +
+      sheets.map(function(sh){
+        const cartons = sh.lines.reduce(function(a,l){return a+(l.cartonsProduced||0);},0);
+        const loose = sh.lines.reduce(function(a,l){return a+(l.looseProduced||0);},0);
+        return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
+          '<td class="mono">'+sh.lines.length+'</td><td class="mono">'+cartons+'</td><td class="mono">'+loose+'</td>' +
+          '<td><button class="btn btn-ghost btn-sm" onclick="App.actions.packViewSheet(\''+sh.id+'\')">View</button></td></tr>';
       }).join('') + '</tbody></table></div>';
   }
   return html;
 }
+function viewPackNewSheet(){
+  const s = App.state;
+  const f = App.ui.packSheetForm;
+  if(!s.finishedProducts.length){
+    return emptyState('No finished products yet', 'Add a finished product in Settings first (packed from a raw material).', 'Go to Settings', "App.actions.nav('settings')");
+  }
+  let html = '<div class="section-head"><h2>New packing sheet \u2014 Step 2</h2>' +
+    '<button class="btn btn-ghost btn-sm" onclick="App.actions.packCancelNew()">Cancel</button></div>';
+  html += '<div class="card" style="margin-bottom:16px;max-width:220px;">' +
+    '<div class="field" style="margin-bottom:0;"><label>Date</label><input type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.packSheetSetDate(this.value)"></div>' +
+    '</div>';
+  html += '<div class="hint" style="margin:-10px 0 13px;">Challan number is assigned automatically when you save.</div>';
+  html += '<label style="display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Line items</label>';
+  html += f.lines.map(function(l,i){return renderPackLineRow(l,i);}).join('');
+  html += '<button class="btn btn-ghost btn-sm" onclick="App.actions.packAddLine()">+ Add line</button>';
+  const totalCartons = f.lines.reduce(function(a,l){return a+packLineCartons(l);},0);
+  const totalLoose = f.lines.reduce(function(a,l){return a+packLineLoose(l);},0);
+  html += '<div class="preview-box" style="margin-top:16px;">Grand total: <strong>'+totalCartons+'</strong> carton(s) + <strong>'+totalLoose+'</strong> loose piece(s) across '+f.lines.length+' line(s)</div>';
+  html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:6px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.packSubmitSheet()">'+(App.ui.busy?'Saving\u2026':'Confirm pack &amp; stamp')+'</button>';
+  return html;
+}
+function viewPackSheetDetail(sheetId){
+  const s = App.state;
+  const sh = s.packingSheets.find(function(x){return x.id===sheetId;});
+  if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  const voidable = !sh.voided && Date.now() < sh.editableUntil;
+  let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.packBackToList()">\u2190 Back</button>' +
+    (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.packVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') + '</div>';
+  html += '<div class="card print-sheet">' +
+    '<div style="text-align:center;margin-bottom:4px;"><div class="disp" style="font-size:22px;">'+escapeHtml(s.meta.companyName||'Company')+'</div>' +
+    '<div class="eyebrow" style="margin-top:4px;">Packing Sheet</div></div>' +
+    '<div style="margin:16px 0 10px;font-size:13px;">Date: <strong>'+escapeHtml(sh.date)+'</strong> &nbsp;\u00b7&nbsp; Challan: <strong>'+escapeHtml(sh.challanNo)+'</strong>' +
+    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + '</div>' +
+    '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Finished product</th><th>Raw material</th><th>Qty packed</th><th>Cartons</th><th>Loose</th></tr></thead><tbody>' +
+    sh.lines.map(function(l,i){
+      return '<tr><td>'+(i+1)+'</td><td>'+escapeHtml(finishedProductName(l.finishedProductId))+'</td><td>'+escapeHtml(rawMaterialName(l.rawMaterialId))+'</td><td class="mono">'+l.qty+'</td>' +
+        '<td class="mono">'+l.cartonsProduced+'</td><td class="mono">'+l.looseProduced+'</td></tr>';
+    }).join('') + '</tbody></table></div>' +
+    '</div>';
+  return html;
+}
+function viewPack(){
+  if(App.ui.packMode==='new') return viewPackNewSheet();
+  if(App.ui.packMode==='view') return viewPackSheetDetail(App.ui.viewingPackSheetId);
+  return viewPackList();
+}
 
 /* ================= LOOSE PIECES ================= */
-function viewLoose(){
-  const s = App.state;
-  let html = '<div class="section-head"><h2>Loose pieces</h2>' +
-    '<button class="btn btn-primary" onclick="App.actions.openLooseReturnModal()">+ Return to refill (Step 2.5)</button></div>';
-
-  if(!s.products.length){
-    return html + emptyState('No products yet', 'Add a mop refill product in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
+function newLooseSheetForm(){
+  return { date: todayISO(), lines: [{productId:'', qty:''}] };
+}
+function looseLineReservedBySiblings(i){
+  const f = App.ui.looseSheetForm;
+  const line = f.lines[i];
+  if(!line.productId) return 0;
+  let reserved = 0;
+  for(let j=0;j<i;j++){
+    if(f.lines[j].productId === line.productId) reserved += Number(f.lines[j].qty)||0;
   }
-
-  html += '<div class="tbl-wrap" style="margin-bottom:24px;"><table><thead><tr><th>Product</th><th>Loose balance</th></tr></thead><tbody>' +
-    s.products.map(function(p){
-      const q = stockFor(p.id).loose;
+  return reserved;
+}
+function renderLooseLineRow(line, i){
+  const st = line.productId ? rawStockFor(line.productId) : null;
+  const qty = Number(line.qty)||0;
+  const rawBalance = st ? st.loose : 0;
+  const reserved = line.productId ? looseLineReservedBySiblings(i) : 0;
+  const availBalance = rawBalance - reserved;
+  let html = '<div class="card" style="margin-bottom:10px;">' +
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
+    '<div class="eyebrow">Line '+(i+1)+'</div>' +
+    '<button class="row-x" onclick="App.actions.looseRemoveLine('+i+')" title="Remove line">&times;</button></div>' +
+    '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;">' +
+    '<div class="field" style="margin-bottom:0;"><label>Raw material</label><select onchange="App.actions.looseLineSetField('+i+',\'productId\',this.value)">' +
+    '<option value="">Select\u2026</option>' + rawMaterialOptionsPlain(line.productId) + '</select></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Qty to return</label>' +
+    '<input type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.looseLineSetField('+i+',\'qty\',this.value)"></div>' +
+    '</div>';
+  if(line.productId){
+    const short = qty > availBalance;
+    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Loose balance: <strong style="margin-left:4px;">'+availBalance+' pcs</strong>'+(short?' \u2014 not enough loose pieces':'')+'</div>';
+    if(reserved>0){
+      html += '<div class="hint" style="margin-top:4px;">'+rawBalance+' pcs in stock \u2014 '+reserved+' pcs already claimed by earlier line(s) using this raw material in this sheet</div>';
+    }
+  }
+  html += '</div>';
+  return html;
+}
+function viewLooseList(){
+  const s = App.state;
+  let html = '<div class="section-head"><h2>Loose pieces (raw material)</h2>' +
+    '<button class="btn btn-primary" onclick="App.actions.looseNewSheet()">+ Return to refill (Step 2.5)</button></div>';
+  if(!s.rawMaterials.length){
+    return html + emptyState('No raw materials yet', 'Add a raw material in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
+  }
+  html += '<div class="tbl-wrap" style="margin-bottom:24px;"><table><thead><tr><th>Raw material</th><th>Loose balance</th></tr></thead><tbody>' +
+    s.rawMaterials.map(function(p){
+      const q = rawStockFor(p.id).loose;
       return '<tr><td>'+escapeHtml(p.name)+'</td><td class="mono">'+q+' pcs'+(q>0?' <span class="pill pill-warn">pending</span>':'')+'</td></tr>';
     }).join('') + '</tbody></table></div>';
-
-  const rows = s.ledger.filter(function(l){return l.area==='loose';}).sort(function(a,b){return b.ts-a.ts;});
-  html += '<div class="section-head"><h2>Loose pieces ledger</h2></div>';
-  if(!rows.length){
-    html += emptyState('No loose-piece activity yet', 'Pack a batch to see leftover pieces logged here.', '', '');
+  const sheets = s.looseReturnSheets.slice().sort(function(a,b){return b.createdAt-a.createdAt;});
+  html += '<div class="section-head"><h2>Loose-return sheets</h2></div>';
+  if(!sheets.length){
+    html += emptyState('No returns yet', 'Return leftover loose pieces back to refill stock whenever you like.', 'New return', 'App.actions.looseNewSheet()');
   } else {
-    html += ledgerTable(rows);
+    html += '<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Challan</th><th>Lines</th><th>Total pcs</th><th></th></tr></thead><tbody>' +
+      sheets.map(function(sh){
+        const total = sh.lines.reduce(function(a,l){return a+(Number(l.qty)||0);},0);
+        return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
+          '<td class="mono">'+sh.lines.length+'</td><td class="mono">'+total+'</td>' +
+          '<td><button class="btn btn-ghost btn-sm" onclick="App.actions.looseViewSheet(\''+sh.id+'\')">View</button></td></tr>';
+      }).join('') + '</tbody></table></div>';
   }
   return html;
 }
+function viewLooseNewSheet(){
+  const s = App.state;
+  const f = App.ui.looseSheetForm;
+  if(!s.rawMaterials.length){
+    return emptyState('No raw materials yet', 'Add a raw material in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
+  }
+  let html = '<div class="section-head"><h2>Return loose pieces \u2014 Step 2.5</h2>' +
+    '<button class="btn btn-ghost btn-sm" onclick="App.actions.looseCancelNew()">Cancel</button></div>';
+  html += '<div class="card" style="margin-bottom:16px;max-width:220px;">' +
+    '<div class="field" style="margin-bottom:0;"><label>Date</label><input type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.looseSheetSetDate(this.value)"></div>' +
+    '</div>';
+  html += '<div class="hint" style="margin:-10px 0 13px;">Challan number is assigned automatically when you save.</div>';
+  html += '<label style="display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Line items</label>';
+  html += f.lines.map(function(l,i){return renderLooseLineRow(l,i);}).join('');
+  html += '<button class="btn btn-ghost btn-sm" onclick="App.actions.looseAddLine()">+ Add line</button>';
+  const total = f.lines.reduce(function(a,l){return a+(Number(l.qty)||0);},0);
+  html += '<div class="preview-box" style="margin-top:16px;">Grand total: <strong>'+total+'</strong> pieces across '+f.lines.length+' line(s)</div>';
+  html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:6px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.looseSubmitSheet()">'+(App.ui.busy?'Saving\u2026':'Return to refill')+'</button>';
+  return html;
+}
+function viewLooseSheetDetail(sheetId){
+  const s = App.state;
+  const sh = s.looseReturnSheets.find(function(x){return x.id===sheetId;});
+  if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  const voidable = !sh.voided && Date.now() < sh.editableUntil;
+  let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.looseBackToList()">\u2190 Back</button>' +
+    (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.looseVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') + '</div>';
+  html += '<div class="card print-sheet">' +
+    '<div style="text-align:center;margin-bottom:4px;"><div class="disp" style="font-size:22px;">'+escapeHtml(s.meta.companyName||'Company')+'</div>' +
+    '<div class="eyebrow" style="margin-top:4px;">Loose-Return Sheet</div></div>' +
+    '<div style="margin:16px 0 10px;font-size:13px;">Date: <strong>'+escapeHtml(sh.date)+'</strong> &nbsp;\u00b7&nbsp; Challan: <strong>'+escapeHtml(sh.challanNo)+'</strong>' +
+    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + '</div>' +
+    '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Raw material</th><th>Qty returned</th></tr></thead><tbody>' +
+    sh.lines.map(function(l,i){
+      return '<tr><td>'+(i+1)+'</td><td>'+escapeHtml(rawMaterialName(l.productId))+'</td><td class="mono">'+l.qty+'</td></tr>';
+    }).join('') + '</tbody></table></div>' +
+    '</div>';
+  return html;
+}
+function viewLoose(){
+  if(App.ui.looseMode==='new') return viewLooseNewSheet();
+  if(App.ui.looseMode==='view') return viewLooseSheetDetail(App.ui.viewingLooseSheetId);
+  return viewLooseList();
+}
 
-/* ================= DISPATCH ================= */
-function viewDispatch(){
+/* ================= DISPATCH (multi-line sheet) ================= */
+function newDispatchSheetForm(){
+  return { date: todayISO(), destination:'', note:'', lines: [{productId:'', qty:''}] };
+}
+function dispatchLineReservedBySiblings(i){
+  const f = App.ui.dispatchSheetForm;
+  const line = f.lines[i];
+  if(!line.productId) return 0;
+  let reserved = 0;
+  for(let j=0;j<i;j++){
+    if(f.lines[j].productId === line.productId) reserved += Number(f.lines[j].qty)||0;
+  }
+  return reserved;
+}
+function renderDispatchLineRow(line, i){
+  const st = line.productId ? finishedStockFor(line.productId) : null;
+  const qty = Number(line.qty)||0;
+  const rawBalance = st ? st.finished : 0;
+  const reserved = line.productId ? dispatchLineReservedBySiblings(i) : 0;
+  const availBalance = rawBalance - reserved;
+  let html = '<div class="card" style="margin-bottom:10px;">' +
+    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
+    '<div class="eyebrow">Line '+(i+1)+'</div>' +
+    '<button class="row-x" onclick="App.actions.dispatchRemoveLine('+i+')" title="Remove line">&times;</button></div>' +
+    '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;">' +
+    '<div class="field" style="margin-bottom:0;"><label>Finished product</label><select onchange="App.actions.dispatchLineSetField('+i+',\'productId\',this.value)">' +
+    '<option value="">Select\u2026</option>' + finishedProductOptionsPlain(line.productId) + '</select></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Cartons to dispatch</label>' +
+    '<input type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.dispatchLineSetField('+i+',\'qty\',this.value)"></div>' +
+    '</div>';
+  if(line.productId){
+    const short = qty > availBalance;
+    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Finished goods: <strong style="margin-left:4px;">'+availBalance+' cartons</strong>'+(short?' \u2014 not enough stock':'')+'</div>';
+    if(reserved>0){
+      html += '<div class="hint" style="margin-top:4px;">'+rawBalance+' cartons in stock \u2014 '+reserved+' already claimed by earlier line(s) using this product in this sheet</div>';
+    }
+  }
+  html += '</div>';
+  return html;
+}
+function viewDispatchList(){
   const s = App.state;
   let html = '<div class="section-head"><h2>Dispatch</h2>' +
-    '<button class="btn btn-primary" onclick="App.actions.openDispatchModal()">+ Dispatch (Step 3)</button></div>';
-
-  if(!s.products.length){
-    return html + emptyState('No products yet', 'Add a mop refill product in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
+    '<button class="btn btn-primary" onclick="App.actions.dispatchNewSheet()">+ New dispatch (Step 3)</button></div>';
+  if(!s.finishedProducts.length){
+    return html + emptyState('No finished products yet', 'Add a finished product in Settings first (packed from a raw material).', 'Go to Settings', "App.actions.nav('settings')");
   }
-
-  html += '<div class="tbl-wrap" style="margin-bottom:24px;"><table><thead><tr><th>Product</th><th>Finished goods (ready)</th></tr></thead><tbody>' +
-    s.products.map(function(p){
-      return '<tr><td>'+escapeHtml(p.name)+'</td><td class="mono">'+stockFor(p.id).finished+' cartons</td></tr>';
+  html += '<div class="tbl-wrap" style="margin-bottom:24px;"><table><thead><tr><th>Finished product</th><th>Finished goods (ready)</th></tr></thead><tbody>' +
+    s.finishedProducts.map(function(p){
+      return '<tr><td>'+escapeHtml(p.name)+'</td><td class="mono">'+finishedStockFor(p.id).finished+' cartons</td></tr>';
     }).join('') + '</tbody></table></div>';
 
   const f = App.ui.reportFilter;
@@ -975,21 +1306,74 @@ function viewDispatch(){
   } else {
     html += '<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Challan</th><th>Product</th><th>Cartons</th><th>Destination</th><th>Note</th><th></th></tr></thead><tbody>' +
       dispatches.map(function(t){
-        const voidable = !t.voided && Date.now() < t.editableUntil;
+        const found = findSheetByTxnId(t.id);
         return '<tr><td>'+fmtDate(t.ts)+'</td><td>'+tag(t.challanNo)+(t.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
-          '<td>'+escapeHtml(productName(t.productId))+'</td><td class="mono">'+t.qty+'</td>' +
+          '<td>'+escapeHtml(finishedProductName(t.productId))+'</td><td class="mono">'+t.qty+'</td>' +
           '<td>'+escapeHtml(t.destination||'\u2014')+'</td><td>'+escapeHtml(t.note||'\u2014')+'</td>' +
-          '<td>'+(voidable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.voidTxn(\''+t.id+'\')">Void</button>':'')+'</td></tr>';
+          '<td>'+(found?'<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchViewSheet(\''+found.sheet.id+'\')">View</button>':'')+'</td></tr>';
       }).join('') + '</tbody></table></div>';
   }
   return html;
+}
+function viewDispatchNewSheet(){
+  const s = App.state;
+  const f = App.ui.dispatchSheetForm;
+  if(!s.finishedProducts.length){
+    return emptyState('No finished products yet', 'Add a finished product in Settings first (packed from a raw material).', 'Go to Settings', "App.actions.nav('settings')");
+  }
+  let html = '<div class="section-head"><h2>New dispatch \u2014 Step 3</h2>' +
+    '<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchCancelNew()">Cancel</button></div>';
+  html += '<div class="card" style="margin-bottom:16px;">' +
+    '<div class="field-row">' +
+    '<div class="field"><label>Date</label><input type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.dispatchSheetSetField(\'date\',this.value)"></div>' +
+    '<div class="field"><label>Destination / buyer (optional)</label><input value="'+escapeHtml(f.destination)+'" oninput="App.actions.dispatchSheetSetField(\'destination\',this.value)" placeholder="Shop, city, distributor"></div>' +
+    '</div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Note (optional)</label><input value="'+escapeHtml(f.note)+'" oninput="App.actions.dispatchSheetSetField(\'note\',this.value)"></div>' +
+    '</div>';
+  html += '<div class="hint" style="margin:-10px 0 13px;">Challan number is assigned automatically when you save.</div>';
+  html += '<label style="display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Line items</label>';
+  html += f.lines.map(function(l,i){return renderDispatchLineRow(l,i);}).join('');
+  html += '<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchAddLine()">+ Add line</button>';
+  const total = f.lines.reduce(function(a,l){return a+(Number(l.qty)||0);},0);
+  html += '<div class="preview-box" style="margin-top:16px;">Grand total: <strong>'+total+'</strong> carton(s) across '+f.lines.length+' line(s)</div>';
+  html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:6px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.dispatchSubmitSheet()">'+(App.ui.busy?'Saving\u2026':'Confirm dispatch &amp; stamp')+'</button>';
+  return html;
+}
+function viewDispatchSheetDetail(sheetId){
+  const s = App.state;
+  const sh = s.dispatchSheets.find(function(x){return x.id===sheetId;});
+  if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  const voidable = !sh.voided && Date.now() < sh.editableUntil;
+  let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchBackToList()">\u2190 Back</button>' +
+    '<div style="display:flex;gap:8px;">' +
+    '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
+    (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.dispatchVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') +
+    '</div></div>';
+  html += '<div class="card print-sheet">' +
+    '<div style="text-align:center;margin-bottom:4px;"><div class="disp" style="font-size:22px;">'+escapeHtml(s.meta.companyName||'Company')+'</div>' +
+    '<div class="eyebrow" style="margin-top:4px;">Dispatch Challan</div></div>' +
+    '<div style="margin:16px 0 10px;font-size:13px;">Date: <strong>'+escapeHtml(sh.date)+'</strong> &nbsp;\u00b7&nbsp; Challan: <strong>'+escapeHtml(sh.challanNo)+'</strong>' +
+    (sh.destination?' &nbsp;\u00b7&nbsp; To: <strong>'+escapeHtml(sh.destination)+'</strong>':'') +
+    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + '</div>' +
+    '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Product</th><th>Cartons</th></tr></thead><tbody>' +
+    sh.lines.map(function(l,i){
+      return '<tr><td>'+(i+1)+'</td><td>'+escapeHtml(finishedProductName(l.productId))+'</td><td class="mono">'+l.qty+'</td></tr>';
+    }).join('') + '</tbody></table></div>' +
+    (sh.note?'<div class="hint" style="margin-top:14px;">Note: '+escapeHtml(sh.note)+'</div>':'') +
+    '</div>';
+  return html;
+}
+function viewDispatch(){
+  if(App.ui.dispatchMode==='new') return viewDispatchNewSheet();
+  if(App.ui.dispatchMode==='view') return viewDispatchSheetDetail(App.ui.viewingDispatchSheetId);
+  return viewDispatchList();
 }
 
 /* ================= LEDGER (all areas) ================= */
 function ledgerTable(rows){
   return '<div class="tbl-wrap"><table><thead><tr><th>When</th><th>Product</th><th>Change</th><th>Balance</th><th>Reason</th><th>Challan</th><th>By</th></tr></thead><tbody>' +
     rows.map(function(r){
-      return '<tr><td>'+fmtDateTime(r.ts)+'</td><td>'+escapeHtml(productName(r.productId))+'</td>' +
+      return '<tr><td>'+fmtDateTime(r.ts)+'</td><td>'+escapeHtml(productNameForArea(r.area, r.productId))+'</td>' +
         '<td class="mono '+(r.delta>=0?'delta-pos':'delta-neg')+'">'+(r.delta>=0?'+':'')+r.delta+'</td>' +
         '<td class="mono">'+r.balanceAfter+'</td><td>'+escapeHtml(r.reason)+'</td>' +
         '<td>'+tag(r.challanNo)+'</td><td>'+escapeHtml(r.user)+'</td></tr>';
@@ -1002,7 +1386,7 @@ function viewLedger(){
   if(f.area !== 'all') rows = rows.filter(function(r){return r.area===f.area;});
   if(f.q){
     const q = f.q.toLowerCase();
-    rows = rows.filter(function(r){return (productName(r.productId)+' '+r.challanNo+' '+r.reason).toLowerCase().includes(q);});
+    rows = rows.filter(function(r){return (productNameForArea(r.area, r.productId)+' '+r.challanNo+' '+r.reason).toLowerCase().includes(q);});
   }
 
   let html = '<div class="section-head"><h2>Full stock ledger</h2></div>';
@@ -1028,22 +1412,47 @@ function viewLedger(){
 /* ================= SETTINGS ================= */
 function viewSettings(){
   const s = App.state;
-  let html = '<div class="section-head"><h2>Products</h2></div>' +
+  let html = '<div class="section-head"><h2>Raw Materials</h2></div>' +
     '<div class="card" style="margin-bottom:22px;">' +
     '<div class="field-row">' +
-    '<div class="field" style="margin-bottom:0;"><label>Name</label><input id="newProdName" placeholder="e.g. Premium 16&quot;"></div>' +
-    '<div class="field" style="margin-bottom:0;"><label>Standard PCS/Bag (optional)</label><input id="newProdPcsBag" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" placeholder="e.g. 240"></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Name</label><input id="newRawName" placeholder="e.g. Premium 16&quot; Refill"></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Standard PCS/Bag (optional)</label><input id="newRawPcsBag" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" placeholder="e.g. 240"></div>' +
     '</div>' +
-    '<div class="field" style="max-width:260px;"><label>Carton size (pieces per carton, for Packing)</label><input id="newProdCarton" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" placeholder="e.g. 100"></div>' +
-    '<button class="btn btn-primary" style="margin-top:4px;" onclick="App.actions.addProduct()">Add product</button>';
-  if(s.products.length){
-    html += '<div class="tbl-wrap" style="margin-top:16px;"><table><thead><tr><th>Product</th><th>Std PCS/Bag</th><th>Carton size</th><th></th></tr></thead><tbody>' +
-      s.products.map(function(p){
-        return '<tr><td>'+escapeHtml(p.name)+'</td><td class="mono">'+(p.pcsPerBag||'\u2014')+'</td><td class="mono">'+p.cartonSize+' pcs</td>' +
-          '<td><button class="btn btn-ghost btn-sm" onclick="App.actions.deleteProduct(\''+p.id+'\')">Delete</button></td></tr>';
+    '<button class="btn btn-primary" style="margin-top:4px;" onclick="App.actions.addRawMaterial()">Add raw material</button>';
+  if(s.rawMaterials.length){
+    html += '<div class="tbl-wrap" style="margin-top:16px;"><table><thead><tr><th>Raw material</th><th>Std PCS/Bag</th><th>Refill</th><th>Loose</th><th></th></tr></thead><tbody>' +
+      s.rawMaterials.map(function(p){
+        const st = rawStockFor(p.id);
+        return '<tr><td>'+escapeHtml(p.name)+'</td><td class="mono">'+(p.pcsPerBag||'\u2014')+'</td><td class="mono">'+st.refill+'</td><td class="mono">'+st.loose+'</td>' +
+          '<td><button class="btn btn-ghost btn-sm" onclick="App.actions.deleteRawMaterial(\''+p.id+'\')">Delete</button></td></tr>';
       }).join('') + '</tbody></table></div>';
   } else {
-    html += '<div class="hint" style="margin-top:10px;">No products yet.</div>';
+    html += '<div class="hint" style="margin-top:10px;">No raw materials yet.</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="section-head"><h2>Finished Products</h2></div>' +
+    '<div class="card" style="margin-bottom:22px;">';
+  if(!s.rawMaterials.length){
+    html += '<div class="hint">Add a raw material above first \u2014 every finished product is packed from one.</div>';
+  } else {
+    html += '<div class="field-row">' +
+      '<div class="field" style="margin-bottom:0;"><label>Name</label><input id="newFinName" placeholder="e.g. Premium 16&quot; Packed Refill"></div>' +
+      '<div class="field" style="margin-bottom:0;"><label>Made from (raw material)</label><select id="newFinRawId">' +
+      '<option value="">Select\u2026</option>' + rawMaterialOptionsPlain('') + '</select></div>' +
+      '</div>' +
+      '<div class="field" style="max-width:260px;"><label>Carton size (pieces per carton)</label><input id="newFinCarton" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" placeholder="e.g. 100"></div>' +
+      '<button class="btn btn-primary" style="margin-top:4px;" onclick="App.actions.addFinishedProduct()">Add finished product</button>';
+    if(s.finishedProducts.length){
+      html += '<div class="tbl-wrap" style="margin-top:16px;"><table><thead><tr><th>Finished product</th><th>Made from</th><th>Carton size</th><th>Finished (cartons)</th><th></th></tr></thead><tbody>' +
+        s.finishedProducts.map(function(p){
+          return '<tr><td>'+escapeHtml(p.name)+'</td><td>'+escapeHtml(rawMaterialName(p.rawMaterialId))+'</td><td class="mono">'+p.cartonSize+' pcs</td>' +
+            '<td class="mono">'+finishedStockFor(p.id).finished+'</td>' +
+            '<td><button class="btn btn-ghost btn-sm" onclick="App.actions.deleteFinishedProduct(\''+p.id+'\')">Delete</button></td></tr>';
+        }).join('') + '</tbody></table></div>';
+    } else {
+      html += '<div class="hint" style="margin-top:10px;">No finished products yet.</div>';
+    }
   }
   html += '</div>';
 
@@ -1061,10 +1470,24 @@ function viewSettings(){
     '</div>';
 
   html += '<div class="section-head"><h2>Data</h2></div>' +
-    '<div class="card" style="display:flex;gap:10px;flex-wrap:wrap;">' +
+    '<div class="card" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">' +
     '<button class="btn btn-ghost" onclick="App.actions.exportJSON()">Export data (JSON)</button>' +
     '<label class="btn btn-ghost" style="cursor:pointer;">Import data (JSON)<input type="file" accept="application/json" style="display:none;" onchange="App.actions.importJSONFile(this)"></label>' +
+    '</div>';
+
+  html += '<div class="section-head"><h2>Danger zone</h2></div>' +
+    '<div class="card" style="display:flex;flex-direction:column;gap:14px;">' +
+    '<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">' +
+    '<div><div style="font-weight:600;">Delete production data</div>' +
+    '<div class="hint">Wipes stock balances, all sheets (refill/pack/loose/dispatch), ledger &amp; challan counters. Raw materials, finished products, and settings are kept.</div></div>' +
+    '<button class="btn btn-danger" onclick="App.actions.deleteProductionData()">Delete production data</button>' +
+    '</div>' +
+    '<div style="border-top:1px solid var(--line);"></div>' +
+    '<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">' +
+    '<div><div style="font-weight:600;">Clear all data</div>' +
+    '<div class="hint">Wipes everything above, plus products and settings. Full factory reset.</div></div>' +
     '<button class="btn btn-danger" onclick="App.actions.clearAllData()">Clear all data</button>' +
+    '</div>' +
     '</div>';
 
   return html;
@@ -1073,33 +1496,58 @@ function viewSettings(){
 /* ================= ACTIONS ================= */
 App.actions.nav = function(tab){ App.ui.tab = tab; render(); };
 
-/* ---- products ---- */
-App.actions.addProduct = async function(){
-  const name = document.getElementById('newProdName').value.trim();
-  const cartonSize = Number(document.getElementById('newProdCarton').value);
-  const pcsPerBag = Number(document.getElementById('newProdPcsBag').value) || null;
-  if(!name) return toast('Enter a product name', 'err');
+/* ---- raw materials ---- */
+App.actions.addRawMaterial = async function(){
+  const name = document.getElementById('newRawName').value.trim();
+  const pcsPerBag = Number(document.getElementById('newRawPcsBag').value) || null;
+  if(!name) return toast('Enter a raw material name', 'err');
+  try{
+    const ref = doc(collection(db,'rawMaterials'));
+    await setDoc(ref, {name: name, pcsPerBag: pcsPerBag, createdAt: Date.now()});
+    await setDoc(doc(db,'stock',ref.id), {refill:0, loose:0});
+    toast('Raw material added', 'ok');
+  }catch(e){ toast('Failed to add raw material: '+e.message, 'err'); }
+};
+App.actions.deleteRawMaterial = async function(id){
+  const dependents = finishedProductsFor(id);
+  if(dependents.length) return toast("Can't delete \u2014 "+dependents.length+" finished product(s) are packed from this raw material", 'err');
+  const st = App.state.stock[id];
+  const used = App.state.transactions.some(function(t){return t.productId===id || t.rawMaterialId===id;}) || (st && (st.refill||st.loose));
+  if(used) return toast("Can't delete \u2014 this raw material has activity", 'err');
+  try{
+    await deleteDoc(doc(db,'rawMaterials',id));
+    await deleteDoc(doc(db,'stock',id));
+  }catch(e){ toast('Failed to delete raw material: '+e.message, 'err'); }
+};
+
+/* ---- finished products ---- */
+App.actions.addFinishedProduct = async function(){
+  const name = document.getElementById('newFinName').value.trim();
+  const rawMaterialId = document.getElementById('newFinRawId').value;
+  const cartonSize = Number(document.getElementById('newFinCarton').value);
+  if(!name) return toast('Enter a finished product name', 'err');
+  if(!rawMaterialId) return toast('Select which raw material this is packed from', 'err');
   if(!cartonSize || cartonSize<1) return toast('Enter a valid carton size (pieces per carton)', 'err');
   try{
-    const ref = doc(collection(db,'products'));
-    await setDoc(ref, {name: name, cartonSize: cartonSize, pcsPerBag: pcsPerBag, createdAt: Date.now()});
-    await setDoc(doc(db,'stock',ref.id), {refill:0, finished:0, loose:0});
-    toast('Product added', 'ok');
-  }catch(e){ toast('Failed to add product: '+e.message, 'err'); }
+    const ref = doc(collection(db,'finishedProducts'));
+    await setDoc(ref, {name: name, rawMaterialId: rawMaterialId, cartonSize: cartonSize, createdAt: Date.now()});
+    await setDoc(doc(db,'finishedStock',ref.id), {finished:0});
+    toast('Finished product added', 'ok');
+  }catch(e){ toast('Failed to add finished product: '+e.message, 'err'); }
 };
-App.actions.deleteProduct = async function(id){
-  const st = App.state.stock[id];
-  const used = App.state.transactions.some(function(t){return t.productId===id;}) || (st && (st.refill||st.finished||st.loose));
-  if(used) return toast("Can't delete \u2014 this product has activity", 'err');
+App.actions.deleteFinishedProduct = async function(id){
+  const st = App.state.finishedStock[id];
+  const used = App.state.transactions.some(function(t){return t.productId===id;}) || (st && st.finished);
+  if(used) return toast("Can't delete \u2014 this finished product has activity", 'err');
   try{
-    await deleteDoc(doc(db,'products',id));
-    await deleteDoc(doc(db,'stock',id));
-  }catch(e){ toast('Failed to delete product: '+e.message, 'err'); }
+    await deleteDoc(doc(db,'finishedProducts',id));
+    await deleteDoc(doc(db,'finishedStock',id));
+  }catch(e){ toast('Failed to delete finished product: '+e.message, 'err'); }
 };
 
 /* ---- Step 1: Refill IN (multi-line material-in sheet) ---- */
 App.actions.refillNewSheet = function(){
-  if(!App.state.products.length) return toast('Add a product first (Settings)', 'err');
+  if(!App.state.rawMaterials.length) return toast('Add a raw material first (Settings)', 'err');
   App.ui.refillSheetForm = newSheetForm();
   App.ui.refillMode = 'new';
   render();
@@ -1110,7 +1558,7 @@ App.actions.refillLineSetField = function(i, key, val){
   const line = App.ui.refillSheetForm.lines[i];
   line[key] = val;
   if(key==='productId' && line.mode==='single'){
-    const p = App.state.products.find(function(x){return x.id===val;});
+    const p = App.state.rawMaterials.find(function(x){return x.id===val;});
     if(p && p.pcsPerBag) line.pcsPerBag = String(p.pcsPerBag);
   }
   render();
@@ -1130,13 +1578,16 @@ App.actions.refillRemoveLine = function(i){
   render();
 };
 App.actions.refillSubmitSheet = async function(){
+  if(App.ui.busy) return;
   const f = App.ui.refillSheetForm;
-  const challanNo = (f.challanNo||'').trim();
   if(!f.date) return toast('Select a date', 'err');
-  if(!challanNo) return toast('Enter the challan number', 'err');
   const validLines = f.lines.filter(lineValid);
   if(!validLines.length) return toast('Add at least one valid line item', 'err');
-  if(challanAlreadyUsed('refill_in', challanNo) && !confirm('Challan '+challanNo+' was already used for a Refill IN entry. Continue anyway?')) return;
+
+  const dup = findRecentDuplicateSheet(App.state.materialInSheets, f.date, f.sheetTitle, validLines);
+  if(dup && !confirm('A sheet with the exact same date, title and items was already saved '+timeAgo(dup.createdAt)+' as Challan '+dup.challanNo+'. Submit this one anyway?')){
+    return;
+  }
 
   const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
 
@@ -1146,8 +1597,8 @@ App.actions.refillSubmitSheet = async function(){
     if(line.mode==='mix'){
       const qtyA = (Number(line.qtyA)||0) * (Number(line.bags)||0);
       const qtyB = (Number(line.qtyB)||0) * (Number(line.bags)||0);
-      if(qtyA>0) credits.push({productId: line.productId, qty: qtyA, note: 'Mix bag with '+productName(line.productIdB)});
-      if(qtyB>0) credits.push({productId: line.productIdB, qty: qtyB, note: 'Mix bag with '+productName(line.productId)});
+      if(qtyA>0) credits.push({productId: line.productId, qty: qtyA, note: 'Mix bag with '+rawMaterialName(line.productIdB)});
+      if(qtyB>0) credits.push({productId: line.productIdB, qty: qtyB, note: 'Mix bag with '+rawMaterialName(line.productId)});
     } else {
       const qty = (Number(line.pcsPerBag)||0) * (Number(line.bags)||0);
       credits.push({productId: line.productId, qty: qty, note: ''});
@@ -1161,13 +1612,19 @@ App.actions.refillSubmitSheet = async function(){
   const stockRefs = {};
   uniqueProductIds.forEach(function(pid){ stockRefs[pid] = doc(db,'stock',pid); });
 
+  App.ui.busy = true;
+  render();
   try{
+    let assignedChallan = '';
     await runTransaction(db, async function(transaction){
       // READS first (Firestore transactions require all gets before any writes)
+      const claim = await claimChallanNumber(transaction, 'refill');
+      const challanNo = claim.challanNo;
+
       const stockData = {};
       for(const pid of uniqueProductIds){
         const snap = await transaction.get(stockRefs[pid]);
-        stockData[pid] = snap.exists() ? snap.data() : {refill:0, finished:0, loose:0};
+        stockData[pid] = snap.exists() ? snap.data() : {refill:0, loose:0};
       }
 
       // Apply credits in order, tracking a running balance per product so
@@ -1196,19 +1653,24 @@ App.actions.refillSubmitSheet = async function(){
         voided:false, createdAt: Date.now(),
         editableUntil: Date.now() + editWindowMs()
       });
+      transaction.set(claim.counterRef, {last: claim.nextNum});
+      assignedChallan = challanNo;
     });
 
     if(f.sheetTitle) setDoc(doc(db,'meta','settings'), {lastSheetTitle: f.sheetTitle}, {merge:true}).catch(function(){});
 
-    App.ui.viewingSheetId = sheetRef.id;
+    App.ui.viewingRefillSheetId = sheetRef.id;
     App.ui.refillMode = 'view';
-    toast('Sheet saved \u2014 stock updated', 'ok');
+    App.ui.busy = false;
+    toast('Sheet saved as '+assignedChallan, 'ok');
     render();
   }catch(e){
+    App.ui.busy = false;
     toast('Failed to save sheet: '+e.message, 'err');
+    render();
   }
 };
-App.actions.refillViewSheet = function(id){ App.ui.viewingSheetId = id; App.ui.refillMode = 'view'; render(); };
+App.actions.refillViewSheet = function(id){ App.ui.tab = 'refill'; App.ui.viewingRefillSheetId = id; App.ui.refillMode = 'view'; render(); };
 App.actions.refillBackToList = function(){ App.ui.refillMode = 'list'; render(); };
 App.actions.refillPrintSheet = function(){ window.print(); };
 App.actions.refillVoidSheet = async function(sheetId){
@@ -1237,7 +1699,7 @@ App.actions.refillVoidSheet = async function(sheetId){
       for(const pid of uniqueProductIds){
         stockRefs[pid] = doc(db,'stock',pid);
         const snap = await transaction.get(stockRefs[pid]);
-        stockData[pid] = snap.exists() ? snap.data() : {refill:0, finished:0, loose:0};
+        stockData[pid] = snap.exists() ? snap.data() : {refill:0, loose:0};
       }
 
       // Guard + compute: walk every txn once, tracking the running balance
@@ -1252,7 +1714,7 @@ App.actions.refillVoidSheet = async function(sheetId){
         const t = s.data();
         if(t.voided) return;
         running[t.productId] -= t.qty;
-        if(running[t.productId] < 0) throw new Error('Cannot void \u2014 stock from "'+productName(t.productId)+'" in this sheet has already been used');
+        if(running[t.productId] < 0) throw new Error('Cannot void \u2014 stock from "'+rawMaterialName(t.productId)+'" in this sheet has already been used');
         reversalSteps.push({txnRef: txnRefs[i], productId: t.productId, qty: t.qty, balanceAfter: running[t.productId]});
       });
 
@@ -1273,226 +1735,482 @@ App.actions.refillVoidSheet = async function(sheetId){
   }
 };
 
-/* ---- Step 2: Pack ---- */
-App.actions.packSetField = function(key, val){ App.ui.pack[key] = val; render(); };
-App.actions.packSubmit = async function(){
-  const d = App.ui.pack;
-  const product = App.state.products.find(function(p){return p.id===d.productId;});
-  const qty = Number(d.qty);
-  const challanNo = (d.challanNo||'').trim();
-  if(!product) return toast('Select a product', 'err');
-  if(!qty || qty<=0) return toast('Enter a valid quantity to pack', 'err');
-  if(!challanNo) return toast('Enter the packing challan number', 'err');
-  if(challanAlreadyUsed('pack', challanNo) && !confirm('Challan '+challanNo+' was already used for a Pack entry. Continue anyway?')) return;
+/* ---- Step 2: Pack (multi-line sheet) ---- */
+App.actions.packNewSheet = function(){
+  if(!App.state.finishedProducts.length) return toast('Add a finished product first (Settings)', 'err');
+  App.ui.packSheetForm = newPackSheetForm();
+  App.ui.packMode = 'new';
+  render();
+};
+App.actions.packCancelNew = function(){ App.ui.packMode='list'; render(); };
+App.actions.packSheetSetDate = function(val){ App.ui.packSheetForm.date = val; render(); };
+App.actions.packLineSetField = function(i, key, val){ App.ui.packSheetForm.lines[i][key] = val; render(); };
+App.actions.packAddLine = function(){ App.ui.packSheetForm.lines.push({finishedProductId:'', qty:''}); render(); };
+App.actions.packRemoveLine = function(i){
+  const f = App.ui.packSheetForm;
+  f.lines.splice(i,1);
+  if(!f.lines.length) f.lines.push({finishedProductId:'', qty:''});
+  render();
+};
+App.actions.packSubmitSheet = async function(){
+  if(App.ui.busy) return;
+  const f = App.ui.packSheetForm;
+  if(!f.date) return toast('Select a date', 'err');
+  const validLines = f.lines.filter(function(l){ return l.finishedProductId && Number(l.qty)>0; });
+  if(!validLines.length) return toast('Add at least one valid line item', 'err');
 
-  const cartonSize = product.cartonSize||1;
-  const cartons = Math.floor(qty / cartonSize);
-  const loose = qty % cartonSize;
-  const stockRef = doc(db,'stock',product.id);
-  const txnRef = doc(collection(db,'transactions'));
+  const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
+  // Resolve each line's raw material up front -- a finished product is always packed from exactly one raw material.
+  const linesResolved = validLines.map(function(line){
+    const fp = App.state.finishedProducts.find(function(p){return p.id===line.finishedProductId;});
+    return {
+      finishedProductId: line.finishedProductId,
+      rawMaterialId: fp ? fp.rawMaterialId : '',
+      cartonSize: (fp && fp.cartonSize) || 1,
+      qty: Number(line.qty)
+    };
+  });
 
+  const uniqueRawIds = linesResolved.reduce(function(arr,l){ if(l.rawMaterialId && arr.indexOf(l.rawMaterialId)===-1) arr.push(l.rawMaterialId); return arr; }, []);
+  const uniqueFinishedIds = linesResolved.reduce(function(arr,l){ if(arr.indexOf(l.finishedProductId)===-1) arr.push(l.finishedProductId); return arr; }, []);
+  const sheetRef = doc(collection(db,'packingSheets'));
+  const txnRefs = linesResolved.map(function(){ return doc(collection(db,'transactions')); });
+  const rawStockRefs = {};
+  uniqueRawIds.forEach(function(id){ rawStockRefs[id] = doc(db,'stock',id); });
+  const finishedStockRefs = {};
+  uniqueFinishedIds.forEach(function(id){ finishedStockRefs[id] = doc(db,'finishedStock',id); });
+
+  App.ui.busy = true;
+  render();
   try{
+    let assignedChallan = '';
     await runTransaction(db, async function(transaction){
-      const snap = await transaction.get(stockRef);
-      const cur = snap.exists() ? snap.data() : {refill:0, finished:0, loose:0};
-      if(qty > cur.refill) throw new Error('Not enough refill stock');
+      const claim = await claimChallanNumber(transaction, 'pack');
+      const challanNo = claim.challanNo;
 
-      const next = {refill: cur.refill-qty, finished: cur.finished+cartons, loose: cur.loose+loose};
-      const now = Date.now();
-      const txnData = buildTxnData('pack', product.id, challanNo, d.note, now, {qtyTaken:qty, cartonsProduced:cartons, looseProduced:loose});
+      const rawStockData = {};
+      for(const id of uniqueRawIds){
+        const snap = await transaction.get(rawStockRefs[id]);
+        rawStockData[id] = snap.exists() ? snap.data() : {refill:0, loose:0};
+      }
+      const finishedStockData = {};
+      for(const id of uniqueFinishedIds){
+        const snap = await transaction.get(finishedStockRefs[id]);
+        finishedStockData[id] = snap.exists() ? snap.data() : {finished:0};
+      }
+      const rawRunning = {};
+      uniqueRawIds.forEach(function(id){ rawRunning[id] = Object.assign({}, rawStockData[id]); });
+      const finishedRunning = {};
+      uniqueFinishedIds.forEach(function(id){ finishedRunning[id] = Object.assign({}, finishedStockData[id]); });
 
-      transaction.set(stockRef, next);
-      transaction.set(txnRef, txnData);
-      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, product.id, 'refill', -qty, next.refill, 'Sent to packing', challanNo, txnData.user));
-      if(cartons>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, product.id, 'finished', cartons, next.finished, 'Packed \u2014 complete cartons', challanNo, txnData.user));
-      if(loose>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, product.id, 'loose', loose, next.loose, 'Packed \u2014 loose pieces', challanNo, txnData.user));
-    });
+      const txnIds = [];
+      const linesOut = [];
+      for(let i=0;i<linesResolved.length;i++){
+        const line = linesResolved[i];
+        if(!line.rawMaterialId) throw new Error('This finished product has no raw material set \u2014 check Settings');
+        if(line.qty > rawRunning[line.rawMaterialId].refill) throw new Error('Not enough refill stock for '+rawMaterialName(line.rawMaterialId));
+        const cartons = Math.floor(line.qty/line.cartonSize);
+        const looseQty = line.qty % line.cartonSize;
 
-    App.ui.pack = {productId:'', qty:'', challanNo:'', note:''};
-    showStamp('Packed \u00b7 '+challanNo);
-    toast('Packed: '+cartons+' carton(s), '+loose+' loose piece(s)', 'ok');
-    render();
-  }catch(e){
-    toast(e.message || 'Pack failed', 'err');
-  }
-};
+        rawRunning[line.rawMaterialId].refill -= line.qty;
+        rawRunning[line.rawMaterialId].loose += looseQty;
+        finishedRunning[line.finishedProductId].finished += cartons;
 
-/* ---- Step 2.5: Loose -> Refill ---- */
-App.actions.openLooseReturnModal = function(){
-  const s = App.state;
-  if(!s.products.length) return toast('Add a product first (Settings)', 'err');
-  const withLoose = s.products.filter(function(p){return stockFor(p.id).loose>0;});
-  openModal('Return loose pieces to refill \u2014 Step 2.5',
-    '<div class="field"><label>Product</label><select id="f_product" onchange="App.actions.looseModalRefresh(this.value)">' +
-    '<option value="">Select\u2026</option>' + productOptions() + '</select></div>' +
-    '<div id="looseBalanceHint"></div>' +
-    '<div class="field"><label>Quantity to return (pieces)</label><input id="f_qty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono"></div>' +
-    '<div class="field"><label>Return challan no.</label><input id="f_challan" class="mono" placeholder="e.g. CH-0212"></div>' +
-    '<div class="field"><label>Note (optional)</label><input id="f_note" placeholder="Remark"></div>' +
-    '<div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal()">Cancel</button>' +
-    '<button class="btn btn-primary" onclick="App.actions.looseReturnSubmit()">Return to refill</button></div>' +
-    (withLoose.length===0 ? '<div class="hint" style="margin-top:8px;">No product currently has loose pieces pending.</div>' : '')
-  );
-};
-App.actions.looseModalRefresh = function(productId){
-  const hint = document.getElementById('looseBalanceHint');
-  if(!hint) return;
-  if(!productId){ hint.innerHTML=''; return; }
-  hint.innerHTML = '<div class="balance-hint">Loose balance: <strong style="margin-left:4px;">'+stockFor(productId).loose+' pcs</strong></div>';
-};
-App.actions.looseReturnSubmit = async function(){
-  const productId = document.getElementById('f_product').value;
-  const qty = Number(document.getElementById('f_qty').value);
-  const challanNo = document.getElementById('f_challan').value.trim();
-  const note = document.getElementById('f_note').value;
-  if(!productId) return toast('Select a product', 'err');
-  if(!qty || qty<=0) return toast('Enter a valid quantity', 'err');
-  if(!challanNo) return toast('Enter the challan number', 'err');
-  if(challanAlreadyUsed('loose_return', challanNo) && !confirm('Challan '+challanNo+' was already used for a Loose Return entry. Continue anyway?')) return;
+        const txnData = buildTxnData('pack', line.finishedProductId, challanNo, '', ts, {
+          rawMaterialId: line.rawMaterialId, qtyTaken: line.qty, cartonsProduced: cartons, looseProduced: looseQty
+        });
+        transaction.set(txnRefs[i], txnData);
+        txnIds.push(txnRefs[i].id);
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRefs[i].id, ts, line.rawMaterialId, 'refill', -line.qty, rawRunning[line.rawMaterialId].refill, 'Sent to packing', challanNo, txnData.user));
+        if(cartons>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRefs[i].id, ts, line.finishedProductId, 'finished', cartons, finishedRunning[line.finishedProductId].finished, 'Packed \u2014 complete cartons', challanNo, txnData.user));
+        if(looseQty>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRefs[i].id, ts, line.rawMaterialId, 'loose', looseQty, rawRunning[line.rawMaterialId].loose, 'Packed \u2014 loose pieces', challanNo, txnData.user));
 
-  const stockRef = doc(db,'stock',productId);
-  const txnRef = doc(collection(db,'transactions'));
-
-  try{
-    await runTransaction(db, async function(transaction){
-      const snap = await transaction.get(stockRef);
-      const cur = snap.exists() ? snap.data() : {refill:0, finished:0, loose:0};
-      if(qty > cur.loose) throw new Error('Not enough loose pieces for that product');
-
-      const next = {refill: cur.refill+qty, finished: cur.finished, loose: cur.loose-qty};
-      const now = Date.now();
-      const txnData = buildTxnData('loose_return', productId, challanNo, note, now, {qty: qty});
-
-      transaction.set(stockRef, next);
-      transaction.set(txnRef, txnData);
-      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, productId, 'loose', -qty, next.loose, 'Returned to refill stock', challanNo, txnData.user));
-      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, productId, 'refill', qty, next.refill, 'Received from loose-piece return', challanNo, txnData.user));
-    });
-    closeModal();
-    toast('Loose pieces returned to refill', 'ok');
-  }catch(e){
-    toast(e.message || 'Failed to return loose pieces', 'err');
-  }
-};
-
-/* ---- Step 3: Dispatch ---- */
-App.actions.openDispatchModal = function(){
-  const s = App.state;
-  if(!s.products.length) return toast('Add a product first (Settings)', 'err');
-  openModal('Dispatch complete cartons \u2014 Step 3',
-    '<div class="field"><label>Product</label><select id="f_product" onchange="App.actions.dispatchModalRefresh(this.value)">' +
-    '<option value="">Select\u2026</option>' + productOptions() + '</select></div>' +
-    '<div id="dispatchBalanceHint"></div>' +
-    '<div class="field"><label>Cartons to dispatch</label><input id="f_qty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono"></div>' +
-    '<div class="field"><label>Dispatch challan no.</label><input id="f_challan" class="mono" placeholder="e.g. CH-0300"></div>' +
-    '<div class="field"><label>Destination / buyer (optional)</label><input id="f_dest" placeholder="Shop, city, distributor"></div>' +
-    '<div class="field"><label>Note (optional)</label><input id="f_note" placeholder="Remark"></div>' +
-    '<div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal()">Cancel</button>' +
-    '<button class="btn btn-primary" onclick="App.actions.dispatchSubmit()">Dispatch</button></div>'
-  );
-};
-App.actions.dispatchModalRefresh = function(productId){
-  const hint = document.getElementById('dispatchBalanceHint');
-  if(!hint) return;
-  if(!productId){ hint.innerHTML=''; return; }
-  hint.innerHTML = '<div class="balance-hint">Finished goods: <strong style="margin-left:4px;">'+stockFor(productId).finished+' cartons</strong></div>';
-};
-App.actions.dispatchSubmit = async function(){
-  const productId = document.getElementById('f_product').value;
-  const qty = Number(document.getElementById('f_qty').value);
-  const challanNo = document.getElementById('f_challan').value.trim();
-  const destination = document.getElementById('f_dest').value.trim();
-  const note = document.getElementById('f_note').value;
-  if(!productId) return toast('Select a product', 'err');
-  if(!qty || qty<=0) return toast('Enter a valid quantity', 'err');
-  if(!challanNo) return toast('Enter the challan number', 'err');
-  if(challanAlreadyUsed('dispatch', challanNo) && !confirm('Challan '+challanNo+' was already used for a Dispatch entry. Continue anyway?')) return;
-
-  const stockRef = doc(db,'stock',productId);
-  const txnRef = doc(collection(db,'transactions'));
-
-  try{
-    await runTransaction(db, async function(transaction){
-      const snap = await transaction.get(stockRef);
-      const cur = snap.exists() ? snap.data() : {refill:0, finished:0, loose:0};
-      if(qty > cur.finished) throw new Error('Not enough finished cartons for that product');
-
-      const next = Object.assign({}, cur, {finished: cur.finished-qty});
-      const now = Date.now();
-      const txnData = buildTxnData('dispatch', productId, challanNo, note, now, {qty: qty, destination: destination});
-
-      transaction.set(stockRef, next);
-      transaction.set(txnRef, txnData);
-      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, now, productId, 'finished', -qty, next.finished, 'Dispatched', challanNo, txnData.user));
-    });
-    closeModal();
-    showStamp('Dispatched \u00b7 '+challanNo);
-    toast('Dispatched '+qty+' carton(s)', 'ok');
-  }catch(e){
-    toast(e.message || 'Dispatch failed', 'err');
-  }
-};
-
-/* ---- void (reverses any transaction type) ---- */
-App.actions.voidTxn = async function(txnId){
-  const cached = App.state.transactions.find(function(t){return t.id===txnId;});
-  if(!cached) return;
-  if(cached.voided) return toast('Already voided', 'err');
-  if(Date.now() > cached.editableUntil) return toast('Void window has passed for this transaction', 'err');
-  if(cached.type==='refill_in'){
-    const sheet = findSheetByTxnId(cached.id);
-    if(sheet) return App.actions.refillVoidSheet(sheet.id);
-  }
-  if(!confirm('Void this '+TXN_LABELS[cached.type]+' entry (Challan '+cached.challanNo+')? This reverses its stock movement.')) return;
-
-  const txnRef = doc(db,'transactions',txnId);
-  const stockRef = doc(db,'stock',cached.productId);
-
-  try{
-    await runTransaction(db, async function(transaction){
-      const txnSnap = await transaction.get(txnRef);
-      if(!txnSnap.exists()) throw new Error('Transaction not found');
-      const txn = txnSnap.data();
-      if(txn.voided) throw new Error('Already voided');
-      if(Date.now() > txn.editableUntil) throw new Error('Void window has passed for this transaction');
-
-      const stockSnap = await transaction.get(stockRef);
-      const cur = stockSnap.exists() ? stockSnap.data() : {refill:0, finished:0, loose:0};
-      const reason = 'Void \u2014 Challan '+txn.challanNo;
-      const now = Date.now();
-      const user = App.state.meta.currentUser||'Operator';
-      let next = Object.assign({}, cur);
-      const ledgerWrites = [];
-
-      // Guard: block the void if reversing it would drive a balance negative
-      // -- i.e. this batch's output has already been consumed downstream.
-      if(txn.type==='pack'){
-        if(cur.finished - txn.cartonsProduced < 0) throw new Error('Cannot void \u2014 cartons from this run have already been dispatched');
-        if(cur.loose - txn.looseProduced < 0) throw new Error('Cannot void \u2014 loose pieces from this run have already been returned');
-        next.refill = cur.refill + txn.qtyTaken;
-        next.finished = cur.finished - txn.cartonsProduced;
-        next.loose = cur.loose - txn.looseProduced;
-        ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'refill', txn.qtyTaken, next.refill, reason, txn.challanNo, user));
-        if(txn.cartonsProduced>0) ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'finished', -txn.cartonsProduced, next.finished, reason, txn.challanNo, user));
-        if(txn.looseProduced>0) ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'loose', -txn.looseProduced, next.loose, reason, txn.challanNo, user));
-      } else if(txn.type==='loose_return'){
-        if(cur.refill - txn.qty < 0) throw new Error('Cannot void \u2014 this refill stock has already been used');
-        next.loose = cur.loose + txn.qty;
-        next.refill = cur.refill - txn.qty;
-        ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'loose', txn.qty, next.loose, reason, txn.challanNo, user));
-        ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'refill', -txn.qty, next.refill, reason, txn.challanNo, user));
-      } else if(txn.type==='dispatch'){
-        next.finished = cur.finished + txn.qty;
-        ledgerWrites.push(buildLedgerData(txnId, now, txn.productId, 'finished', txn.qty, next.finished, reason, txn.challanNo, user));
+        linesOut.push({finishedProductId: line.finishedProductId, rawMaterialId: line.rawMaterialId, qty: line.qty, cartonsProduced: cartons, looseProduced: looseQty});
       }
 
-      transaction.set(stockRef, next);
-      transaction.update(txnRef, {voided:true});
-      ledgerWrites.forEach(function(data){ transaction.set(doc(collection(db,'ledger')), data); });
+      uniqueRawIds.forEach(function(id){ transaction.set(rawStockRefs[id], rawRunning[id]); });
+      uniqueFinishedIds.forEach(function(id){ transaction.set(finishedStockRefs[id], finishedRunning[id]); });
+      transaction.set(sheetRef, {
+        date: f.date, challanNo: challanNo, lines: linesOut, txnIds: txnIds,
+        voided:false, createdAt: Date.now(), editableUntil: Date.now()+editWindowMs()
+      });
+      transaction.set(claim.counterRef, {last: claim.nextNum});
+      assignedChallan = challanNo;
     });
-    toast('Voided', 'ok');
+
+    App.ui.viewingPackSheetId = sheetRef.id;
+    App.ui.packMode = 'view';
+    App.ui.busy = false;
+    showStamp('Packed \u00b7 '+assignedChallan);
+    toast('Packing sheet saved as '+assignedChallan, 'ok');
+    render();
   }catch(e){
-    toast(e.message || 'Failed to void', 'err');
+    App.ui.busy = false;
+    toast(e.message || 'Pack failed', 'err');
+    render();
+  }
+};
+App.actions.packViewSheet = function(id){ App.ui.tab = 'pack'; App.ui.viewingPackSheetId = id; App.ui.packMode = 'view'; render(); };
+App.actions.packBackToList = function(){ App.ui.packMode = 'list'; render(); };
+App.actions.packVoidSheet = async function(sheetId){
+  const cached = App.state.packingSheets.find(function(s){return s.id===sheetId;});
+  if(!cached) return;
+  if(cached.voided) return toast('Already voided', 'err');
+  if(Date.now() > cached.editableUntil) return toast('Void window has passed for this sheet', 'err');
+  if(!confirm('Void this entire packing sheet (Challan '+cached.challanNo+')? This reverses all line(s).')) return;
+
+  const sheetRef = doc(db,'packingSheets',sheetId);
+  try{
+    await runTransaction(db, async function(transaction){
+      const sheetSnap = await transaction.get(sheetRef);
+      if(!sheetSnap.exists()) throw new Error('Sheet not found');
+      const sheet = sheetSnap.data();
+      if(sheet.voided) throw new Error('Already voided');
+      if(Date.now() > sheet.editableUntil) throw new Error('Void window has passed for this sheet');
+
+      const txnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
+      const txnSnaps = [];
+      for(const ref of txnRefs){ txnSnaps.push(await transaction.get(ref)); }
+
+      const uniqueRawIds = [];
+      const uniqueFinishedIds = [];
+      txnSnaps.forEach(function(s){
+        if(!s.exists()) return;
+        const t = s.data();
+        if(t.rawMaterialId && uniqueRawIds.indexOf(t.rawMaterialId)===-1) uniqueRawIds.push(t.rawMaterialId);
+        if(uniqueFinishedIds.indexOf(t.productId)===-1) uniqueFinishedIds.push(t.productId);
+      });
+      const rawStockRefs = {}; const rawStockData = {};
+      for(const id of uniqueRawIds){
+        rawStockRefs[id] = doc(db,'stock',id);
+        const snap = await transaction.get(rawStockRefs[id]);
+        rawStockData[id] = snap.exists() ? snap.data() : {refill:0, loose:0};
+      }
+      const finishedStockRefs = {}; const finishedStockData = {};
+      for(const id of uniqueFinishedIds){
+        finishedStockRefs[id] = doc(db,'finishedStock',id);
+        const snap = await transaction.get(finishedStockRefs[id]);
+        finishedStockData[id] = snap.exists() ? snap.data() : {finished:0};
+      }
+      const rawRunning = {};
+      uniqueRawIds.forEach(function(id){ rawRunning[id] = Object.assign({}, rawStockData[id]); });
+      const finishedRunning = {};
+      uniqueFinishedIds.forEach(function(id){ finishedRunning[id] = Object.assign({}, finishedStockData[id]); });
+
+      const reversalSteps = [];
+      txnSnaps.forEach(function(s, i){
+        if(!s.exists() || s.data().voided) return;
+        const t = s.data();
+        if(finishedRunning[t.productId].finished - t.cartonsProduced < 0) throw new Error('Cannot void \u2014 cartons from "'+finishedProductName(t.productId)+'" have already been dispatched');
+        if(rawRunning[t.rawMaterialId].loose - t.looseProduced < 0) throw new Error('Cannot void \u2014 loose pieces from "'+rawMaterialName(t.rawMaterialId)+'" have already been returned');
+        rawRunning[t.rawMaterialId].refill += t.qtyTaken;
+        rawRunning[t.rawMaterialId].loose -= t.looseProduced;
+        finishedRunning[t.productId].finished -= t.cartonsProduced;
+        reversalSteps.push({
+          txnRef: txnRefs[i], finishedProductId: t.productId, rawMaterialId: t.rawMaterialId, t: t,
+          snap: {refill:rawRunning[t.rawMaterialId].refill, loose:rawRunning[t.rawMaterialId].loose, finished:finishedRunning[t.productId].finished}
+        });
+      });
+
+      const reason = 'Void \u2014 Challan '+sheet.challanNo;
+      reversalSteps.forEach(function(step){
+        transaction.update(step.txnRef, {voided:true});
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.rawMaterialId, 'refill', step.t.qtyTaken, step.snap.refill, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+        if(step.t.cartonsProduced>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.finishedProductId, 'finished', -step.t.cartonsProduced, step.snap.finished, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+        if(step.t.looseProduced>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.rawMaterialId, 'loose', -step.t.looseProduced, step.snap.loose, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+      });
+      uniqueRawIds.forEach(function(id){ transaction.set(rawStockRefs[id], rawRunning[id]); });
+      uniqueFinishedIds.forEach(function(id){ transaction.set(finishedStockRefs[id], finishedRunning[id]); });
+      transaction.update(sheetRef, {voided:true});
+    });
+    toast('Packing sheet voided', 'ok');
+  }catch(e){
+    toast(e.message || 'Failed to void sheet', 'err');
+  }
+};
+
+/* ---- Step 2.5: Loose -> Refill (multi-line sheet) ---- */
+App.actions.looseNewSheet = function(){
+  if(!App.state.rawMaterials.length) return toast('Add a raw material first (Settings)', 'err');
+  App.ui.looseSheetForm = newLooseSheetForm();
+  App.ui.looseMode = 'new';
+  render();
+};
+App.actions.looseCancelNew = function(){ App.ui.looseMode='list'; render(); };
+App.actions.looseSheetSetDate = function(val){ App.ui.looseSheetForm.date = val; render(); };
+App.actions.looseLineSetField = function(i, key, val){ App.ui.looseSheetForm.lines[i][key] = val; render(); };
+App.actions.looseAddLine = function(){ App.ui.looseSheetForm.lines.push({productId:'', qty:''}); render(); };
+App.actions.looseRemoveLine = function(i){
+  const f = App.ui.looseSheetForm;
+  f.lines.splice(i,1);
+  if(!f.lines.length) f.lines.push({productId:'', qty:''});
+  render();
+};
+App.actions.looseSubmitSheet = async function(){
+  const f = App.ui.looseSheetForm;
+  if(App.ui.busy) return;
+  if(!f.date) return toast('Select a date', 'err');
+  const validLines = f.lines.filter(function(l){ return l.productId && Number(l.qty)>0; });
+  if(!validLines.length) return toast('Add at least one valid line item', 'err');
+
+  const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
+  const uniqueProductIds = validLines.reduce(function(arr,l){ if(arr.indexOf(l.productId)===-1) arr.push(l.productId); return arr; }, []);
+  const sheetRef = doc(collection(db,'looseReturnSheets'));
+  const txnRefs = validLines.map(function(){ return doc(collection(db,'transactions')); });
+  const stockRefs = {};
+  uniqueProductIds.forEach(function(pid){ stockRefs[pid] = doc(db,'stock',pid); });
+
+  App.ui.busy = true;
+  render();
+  try{
+    let assignedChallan = '';
+    await runTransaction(db, async function(transaction){
+      const claim = await claimChallanNumber(transaction, 'loose');
+      const challanNo = claim.challanNo;
+
+      const stockData = {};
+      for(const pid of uniqueProductIds){
+        const snap = await transaction.get(stockRefs[pid]);
+        stockData[pid] = snap.exists() ? snap.data() : {refill:0, loose:0};
+      }
+      const running = {};
+      uniqueProductIds.forEach(function(pid){ running[pid] = Object.assign({}, stockData[pid]); });
+
+      const txnIds = [];
+      const linesOut = [];
+      for(let i=0;i<validLines.length;i++){
+        const line = validLines[i];
+        const qty = Number(line.qty);
+        if(qty > running[line.productId].loose) throw new Error('Not enough loose pieces for '+rawMaterialName(line.productId));
+
+        running[line.productId].loose -= qty;
+        running[line.productId].refill += qty;
+
+        const txnData = buildTxnData('loose_return', line.productId, challanNo, '', ts, {qty: qty});
+        transaction.set(txnRefs[i], txnData);
+        txnIds.push(txnRefs[i].id);
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRefs[i].id, ts, line.productId, 'loose', -qty, running[line.productId].loose, 'Returned to refill stock', challanNo, txnData.user));
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRefs[i].id, ts, line.productId, 'refill', qty, running[line.productId].refill, 'Received from loose-piece return', challanNo, txnData.user));
+
+        linesOut.push({productId: line.productId, qty: qty});
+      }
+
+      uniqueProductIds.forEach(function(pid){ transaction.set(stockRefs[pid], running[pid]); });
+      transaction.set(sheetRef, {
+        date: f.date, challanNo: challanNo, lines: linesOut, txnIds: txnIds,
+        voided:false, createdAt: Date.now(), editableUntil: Date.now()+editWindowMs()
+      });
+      transaction.set(claim.counterRef, {last: claim.nextNum});
+      assignedChallan = challanNo;
+    });
+
+    App.ui.viewingLooseSheetId = sheetRef.id;
+    App.ui.looseMode = 'view';
+    App.ui.busy = false;
+    toast('Loose-return sheet saved as '+assignedChallan, 'ok');
+    render();
+  }catch(e){
+    App.ui.busy = false;
+    toast(e.message || 'Failed to return loose pieces', 'err');
+    render();
+  }
+};
+App.actions.looseViewSheet = function(id){ App.ui.tab = 'loose'; App.ui.viewingLooseSheetId = id; App.ui.looseMode = 'view'; render(); };
+App.actions.looseBackToList = function(){ App.ui.looseMode = 'list'; render(); };
+App.actions.looseVoidSheet = async function(sheetId){
+  const cached = App.state.looseReturnSheets.find(function(s){return s.id===sheetId;});
+  if(!cached) return;
+  if(cached.voided) return toast('Already voided', 'err');
+  if(Date.now() > cached.editableUntil) return toast('Void window has passed for this sheet', 'err');
+  if(!confirm('Void this entire loose-return sheet (Challan '+cached.challanNo+')? This reverses all line(s).')) return;
+
+  const sheetRef = doc(db,'looseReturnSheets',sheetId);
+  try{
+    await runTransaction(db, async function(transaction){
+      const sheetSnap = await transaction.get(sheetRef);
+      if(!sheetSnap.exists()) throw new Error('Sheet not found');
+      const sheet = sheetSnap.data();
+      if(sheet.voided) throw new Error('Already voided');
+      if(Date.now() > sheet.editableUntil) throw new Error('Void window has passed for this sheet');
+
+      const txnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
+      const txnSnaps = [];
+      for(const ref of txnRefs){ txnSnaps.push(await transaction.get(ref)); }
+
+      const uniqueProductIds = [];
+      txnSnaps.forEach(function(s){ if(s.exists()){ const pid=s.data().productId; if(uniqueProductIds.indexOf(pid)===-1) uniqueProductIds.push(pid); } });
+      const stockRefs = {}; const stockData = {};
+      for(const pid of uniqueProductIds){
+        stockRefs[pid] = doc(db,'stock',pid);
+        const snap = await transaction.get(stockRefs[pid]);
+        stockData[pid] = snap.exists() ? snap.data() : {refill:0, loose:0};
+      }
+      const running = {};
+      uniqueProductIds.forEach(function(pid){ running[pid] = Object.assign({}, stockData[pid]); });
+
+      const reversalSteps = [];
+      txnSnaps.forEach(function(s, i){
+        if(!s.exists() || s.data().voided) return;
+        const t = s.data();
+        if(running[t.productId].refill - t.qty < 0) throw new Error('Cannot void \u2014 refill stock from "'+rawMaterialName(t.productId)+'" has already been used');
+        running[t.productId].loose += t.qty;
+        running[t.productId].refill -= t.qty;
+        reversalSteps.push({txnRef: txnRefs[i], productId: t.productId, t: t, snap: {refill:running[t.productId].refill, loose:running[t.productId].loose}});
+      });
+
+      const reason = 'Void \u2014 Challan '+sheet.challanNo;
+      reversalSteps.forEach(function(step){
+        transaction.update(step.txnRef, {voided:true});
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'loose', step.t.qty, step.snap.loose, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'refill', -step.t.qty, step.snap.refill, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+      });
+      uniqueProductIds.forEach(function(pid){ transaction.set(stockRefs[pid], running[pid]); });
+      transaction.update(sheetRef, {voided:true});
+    });
+    toast('Loose-return sheet voided', 'ok');
+  }catch(e){
+    toast(e.message || 'Failed to void sheet', 'err');
+  }
+};
+
+/* ---- Step 3: Dispatch (multi-line sheet) ---- */
+App.actions.dispatchNewSheet = function(){
+  if(!App.state.finishedProducts.length) return toast('Add a finished product first (Settings)', 'err');
+  App.ui.dispatchSheetForm = newDispatchSheetForm();
+  App.ui.dispatchMode = 'new';
+  render();
+};
+App.actions.dispatchCancelNew = function(){ App.ui.dispatchMode='list'; render(); };
+App.actions.dispatchSheetSetField = function(key, val){ App.ui.dispatchSheetForm[key] = val; render(); };
+App.actions.dispatchLineSetField = function(i, key, val){ App.ui.dispatchSheetForm.lines[i][key] = val; render(); };
+App.actions.dispatchAddLine = function(){ App.ui.dispatchSheetForm.lines.push({productId:'', qty:''}); render(); };
+App.actions.dispatchRemoveLine = function(i){
+  const f = App.ui.dispatchSheetForm;
+  f.lines.splice(i,1);
+  if(!f.lines.length) f.lines.push({productId:'', qty:''});
+  render();
+};
+App.actions.dispatchSubmitSheet = async function(){
+  if(App.ui.busy) return;
+  const f = App.ui.dispatchSheetForm;
+  if(!f.date) return toast('Select a date', 'err');
+  const validLines = f.lines.filter(function(l){ return l.productId && Number(l.qty)>0; });
+  if(!validLines.length) return toast('Add at least one valid line item', 'err');
+
+  const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
+  const uniqueProductIds = validLines.reduce(function(arr,l){ if(arr.indexOf(l.productId)===-1) arr.push(l.productId); return arr; }, []);
+  const sheetRef = doc(collection(db,'dispatchSheets'));
+  const txnRefs = validLines.map(function(){ return doc(collection(db,'transactions')); });
+  const stockRefs = {};
+  uniqueProductIds.forEach(function(pid){ stockRefs[pid] = doc(db,'finishedStock',pid); });
+
+  App.ui.busy = true;
+  render();
+  try{
+    let assignedChallan = '';
+    await runTransaction(db, async function(transaction){
+      const claim = await claimChallanNumber(transaction, 'dispatch');
+      const challanNo = claim.challanNo;
+
+      const stockData = {};
+      for(const pid of uniqueProductIds){
+        const snap = await transaction.get(stockRefs[pid]);
+        stockData[pid] = snap.exists() ? snap.data() : {finished:0};
+      }
+      const running = {};
+      uniqueProductIds.forEach(function(pid){ running[pid] = Object.assign({}, stockData[pid]); });
+
+      const txnIds = [];
+      const linesOut = [];
+      for(let i=0;i<validLines.length;i++){
+        const line = validLines[i];
+        const qty = Number(line.qty);
+        if(qty > running[line.productId].finished) throw new Error('Not enough finished cartons for '+finishedProductName(line.productId));
+
+        running[line.productId].finished -= qty;
+
+        const txnData = buildTxnData('dispatch', line.productId, challanNo, f.note, ts, {qty: qty, destination: f.destination||''});
+        transaction.set(txnRefs[i], txnData);
+        txnIds.push(txnRefs[i].id);
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRefs[i].id, ts, line.productId, 'finished', -qty, running[line.productId].finished, 'Dispatched', challanNo, txnData.user));
+
+        linesOut.push({productId: line.productId, qty: qty});
+      }
+
+      uniqueProductIds.forEach(function(pid){ transaction.set(stockRefs[pid], running[pid]); });
+      transaction.set(sheetRef, {
+        date: f.date, challanNo: challanNo, destination: f.destination||'', note: f.note||'',
+        lines: linesOut, txnIds: txnIds,
+        voided:false, createdAt: Date.now(), editableUntil: Date.now()+editWindowMs()
+      });
+      transaction.set(claim.counterRef, {last: claim.nextNum});
+      assignedChallan = challanNo;
+    });
+
+    App.ui.viewingDispatchSheetId = sheetRef.id;
+    App.ui.dispatchMode = 'view';
+    App.ui.busy = false;
+    showStamp('Dispatched \u00b7 '+assignedChallan);
+    toast('Dispatch sheet saved as '+assignedChallan, 'ok');
+    render();
+  }catch(e){
+    App.ui.busy = false;
+    toast(e.message || 'Dispatch failed', 'err');
+    render();
+  }
+};
+App.actions.dispatchViewSheet = function(id){ App.ui.tab = 'dispatch'; App.ui.viewingDispatchSheetId = id; App.ui.dispatchMode = 'view'; render(); };
+App.actions.dispatchBackToList = function(){ App.ui.dispatchMode = 'list'; render(); };
+App.actions.dispatchVoidSheet = async function(sheetId){
+  const cached = App.state.dispatchSheets.find(function(s){return s.id===sheetId;});
+  if(!cached) return;
+  if(cached.voided) return toast('Already voided', 'err');
+  if(Date.now() > cached.editableUntil) return toast('Void window has passed for this sheet', 'err');
+  if(!confirm('Void this entire dispatch (Challan '+cached.challanNo+')? This reverses all line(s).')) return;
+
+  const sheetRef = doc(db,'dispatchSheets',sheetId);
+  try{
+    await runTransaction(db, async function(transaction){
+      const sheetSnap = await transaction.get(sheetRef);
+      if(!sheetSnap.exists()) throw new Error('Sheet not found');
+      const sheet = sheetSnap.data();
+      if(sheet.voided) throw new Error('Already voided');
+      if(Date.now() > sheet.editableUntil) throw new Error('Void window has passed for this sheet');
+
+      const txnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
+      const txnSnaps = [];
+      for(const ref of txnRefs){ txnSnaps.push(await transaction.get(ref)); }
+
+      const uniqueProductIds = [];
+      txnSnaps.forEach(function(s){ if(s.exists()){ const pid=s.data().productId; if(uniqueProductIds.indexOf(pid)===-1) uniqueProductIds.push(pid); } });
+      const stockRefs = {}; const stockData = {};
+      for(const pid of uniqueProductIds){
+        stockRefs[pid] = doc(db,'finishedStock',pid);
+        const snap = await transaction.get(stockRefs[pid]);
+        stockData[pid] = snap.exists() ? snap.data() : {finished:0};
+      }
+      const running = {};
+      uniqueProductIds.forEach(function(pid){ running[pid] = Object.assign({}, stockData[pid]); });
+
+      const reversalSteps = [];
+      txnSnaps.forEach(function(s, i){
+        if(!s.exists() || s.data().voided) return;
+        const t = s.data();
+        running[t.productId].finished += t.qty;
+        reversalSteps.push({txnRef: txnRefs[i], productId: t.productId, t: t, snap:{finished: running[t.productId].finished}});
+      });
+
+      const reason = 'Void \u2014 Challan '+sheet.challanNo;
+      reversalSteps.forEach(function(step){
+        transaction.update(step.txnRef, {voided:true});
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'finished', step.t.qty, step.snap.finished, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+      });
+      uniqueProductIds.forEach(function(pid){ transaction.set(stockRefs[pid], running[pid]); });
+      transaction.update(sheetRef, {voided:true});
+    });
+    toast('Dispatch voided', 'ok');
+  }catch(e){
+    toast(e.message || 'Failed to void dispatch', 'err');
   }
 };
 
@@ -1510,20 +2228,28 @@ function downloadBlob(content, mime, filename){
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+// Guards against CSV/formula injection: a cell starting with =, +, -, or @
+// is interpreted as a formula by Excel/Sheets when the file is opened, so
+// prefix it with a leading quote to force it to be read as plain text.
+function csvCell(v){
+  let s = String(v==null?'':v);
+  if(/^[=+\-@]/.test(s)) s = "'"+s;
+  return '"'+s.replace(/"/g,'""')+'"';
+}
 App.actions.exportLedgerCSV = function(){
   const rows = [['When','Area','Product','Change','Balance','Reason','Challan','By']];
   App.state.ledger.slice().sort(function(a,b){return a.ts-b.ts;}).forEach(function(r){
-    rows.push([fmtDateTime(r.ts), r.area, productName(r.productId), r.delta, r.balanceAfter, r.reason, r.challanNo, r.user]);
+    rows.push([fmtDateTime(r.ts), r.area, productNameForArea(r.area, r.productId), r.delta, r.balanceAfter, r.reason, r.challanNo, r.user]);
   });
-  const csv = rows.map(function(r){return r.map(function(c){return '"'+String(c).replace(/"/g,'""')+'"';}).join(',');}).join('\n');
+  const csv = rows.map(function(r){return r.map(csvCell).join(',');}).join('\n');
   downloadBlob(csv, 'text/csv', 'packing-ledger.csv');
 };
 App.actions.exportDispatchCSV = function(){
   const rows = [['Date','Challan','Product','Cartons','Destination','Note','Voided']];
   App.state.transactions.filter(function(t){return t.type==='dispatch';}).sort(function(a,b){return a.ts-b.ts;}).forEach(function(t){
-    rows.push([fmtDate(t.ts), t.challanNo, productName(t.productId), t.qty, t.destination||'', t.note||'', t.voided?'Yes':'No']);
+    rows.push([fmtDate(t.ts), t.challanNo, finishedProductName(t.productId), t.qty, t.destination||'', t.note||'', t.voided?'Yes':'No']);
   });
-  const csv = rows.map(function(r){return r.map(function(c){return '"'+String(c).replace(/"/g,'""')+'"';}).join(',');}).join('\n');
+  const csv = rows.map(function(r){return r.map(csvCell).join(',');}).join('\n');
   downloadBlob(csv, 'text/csv', 'dispatch-report.csv');
 };
 
@@ -1543,13 +2269,14 @@ App.actions.importJSONFile = function(inputEl){
       const parsed = JSON.parse(e.target.result);
       if(!confirm('Import will ADD these records into the shared cloud database (existing data is not removed). Continue?')) return;
 
-      const collections = ['products','stock','transactions','materialInSheets','ledger'];
+      const mapCollections = ['stock','finishedStock'];
+      const listCollections = ['rawMaterials','finishedProducts','transactions','materialInSheets','packingSheets','looseReturnSheets','dispatchSheets','ledger','counters'];
       const writes = [];
-      collections.forEach(function(col){
+      mapCollections.concat(listCollections).forEach(function(col){
         const items = parsed[col];
         if(!items) return;
-        if(col==='stock'){
-          Object.keys(items).forEach(function(pid){ writes.push({ref: doc(db,'stock',pid), data: items[pid]}); });
+        if(mapCollections.indexOf(col)!==-1){
+          Object.keys(items).forEach(function(pid){ writes.push({ref: doc(db,col,pid), data: items[pid]}); });
         } else if(Array.isArray(items)){
           items.forEach(function(item){
             const id = item.id || uid(col);
@@ -1574,10 +2301,10 @@ App.actions.importJSONFile = function(inputEl){
   reader.readAsText(file);
 };
 App.actions.clearAllData = async function(){
-  if(!confirm('This will permanently erase ALL shared cloud data for every device using this app. Continue?')) return;
+  if(!confirm('This will permanently erase ALL shared cloud data for every device using this app -- including products and settings. Continue?')) return;
   if(!confirm('Really sure? This cannot be undone.')) return;
   try{
-    const collections = ['products','stock','transactions','materialInSheets','ledger'];
+    const collections = ['rawMaterials','finishedProducts','stock','finishedStock','transactions','materialInSheets','packingSheets','looseReturnSheets','dispatchSheets','ledger','counters'];
     for(const col of collections){
       const snap = await getDocs(collection(db,col));
       const refs = snap.docs.map(function(d){ return d.ref; });
@@ -1591,6 +2318,25 @@ App.actions.clearAllData = async function(){
     toast('All cloud data cleared', 'ok');
   }catch(e){
     toast('Failed to clear data: '+e.message, 'err');
+  }
+};
+App.actions.deleteProductionData = async function(){
+  if(!confirm('This will permanently erase all production data (stock balances, all material-in/pack/loose/dispatch sheets, the ledger, and challan counters) for every device using this app. Raw materials, finished products, and settings will be KEPT. Continue?')) return;
+  if(!confirm('Really sure? This cannot be undone.')) return;
+  try{
+    const collections = ['stock','finishedStock','transactions','materialInSheets','packingSheets','looseReturnSheets','dispatchSheets','ledger','counters'];
+    for(const col of collections){
+      const snap = await getDocs(collection(db,col));
+      const refs = snap.docs.map(function(d){ return d.ref; });
+      for(let i=0;i<refs.length;i+=400){
+        const batch = writeBatch(db);
+        refs.slice(i,i+400).forEach(function(ref){ batch.delete(ref); });
+        await batch.commit();
+      }
+    }
+    toast('Production data cleared \u2014 raw materials, finished products, and settings kept', 'ok');
+  }catch(e){
+    toast('Failed to clear production data: '+e.message, 'err');
   }
 };
 

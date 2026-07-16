@@ -763,6 +763,7 @@ function render(){
 
 /* ================= DASHBOARD ================= */
 function productNameForTxn(t){
+  if(t.type==='dispatch' && (t.kind||'carton')==='loose') return rawMaterialName(t.productId);
   return (t.type==='refill_in' || t.type==='loose_return' || t.type==='adjustment') ? rawMaterialName(t.productId) : finishedProductName(t.productId);
 }
 function viewDashboard(){
@@ -1231,26 +1232,44 @@ function viewLoose(){
 
 /* ================= DISPATCH (multi-line sheet) ================= */
 function newDispatchSheetForm(){
-  return { date: todayISO(), destination:'', note:'', lines: [{productId:'', qty:''}] };
+  return { date: todayISO(), destination:'', note:'', lines: [{kind:'carton', productId:'', qty:''}] };
 }
 function renderDispatchLineRow(line, i){
-  const st = line.productId ? finishedStockFor(line.productId) : null;
+  const kind = line.kind || 'carton';
   const qty = Number(line.qty)||0;
+  let productField, qtyLabel, balanceHtml = '';
+  if(kind === 'loose'){
+    productField = '<div class="field" style="margin-bottom:0;"><label>Raw material (loose)</label><select onchange="App.actions.dispatchLineSetField('+i+',\'productId\',this.value)">' +
+      '<option value="">Select\u2026</option>' + rawMaterialOptionsPlain(line.productId) + '</select></div>';
+    qtyLabel = 'Loose pieces to dispatch';
+    if(line.productId){
+      const bal = rawStockFor(line.productId).loose;
+      const short = qty > bal;
+      balanceHtml = '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Loose pieces: <strong style="margin-left:4px;">'+bal+' pcs</strong>'+(short?' \u2014 not enough stock':'')+'</div>';
+    }
+  } else {
+    productField = '<div class="field" style="margin-bottom:0;"><label>Finished product</label><select onchange="App.actions.dispatchLineSetField('+i+',\'productId\',this.value)">' +
+      '<option value="">Select\u2026</option>' + finishedProductOptionsPlain(line.productId) + '</select></div>';
+    qtyLabel = 'Cartons to dispatch';
+    if(line.productId){
+      const bal = finishedStockFor(line.productId).finished;
+      const short = qty > bal;
+      balanceHtml = '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Finished goods: <strong style="margin-left:4px;">'+bal+' cartons</strong>'+(short?' \u2014 not enough stock':'')+'</div>';
+    }
+  }
   let html = '<div class="card" style="margin-bottom:10px;">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
-    '<div class="eyebrow">Line '+(i+1)+'</div>' +
+    '<div style="display:flex;gap:6px;align-items:center;">' +
+    '<div class="eyebrow" style="margin-right:6px;">Line '+(i+1)+'</div>' +
+    '<button class="btn btn-sm '+(kind==='carton'?'btn-primary':'btn-ghost')+'" onclick="App.actions.dispatchLineSetKind('+i+',\'carton\')">Cartons</button>' +
+    '<button class="btn btn-sm '+(kind==='loose'?'btn-primary':'btn-ghost')+'" onclick="App.actions.dispatchLineSetKind('+i+',\'loose\')">Loose pieces</button>' +
+    '</div>' +
     '<button class="row-x" onclick="App.actions.dispatchRemoveLine('+i+')" title="Remove line">&times;</button></div>' +
     '<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;">' +
-    '<div class="field" style="margin-bottom:0;"><label>Finished product</label><select onchange="App.actions.dispatchLineSetField('+i+',\'productId\',this.value)">' +
-    '<option value="">Select\u2026</option>' + finishedProductOptionsPlain(line.productId) + '</select></div>' +
-    '<div class="field" style="margin-bottom:0;"><label>Cartons to dispatch</label>' +
+    productField +
+    '<div class="field" style="margin-bottom:0;"><label>'+qtyLabel+'</label>' +
     '<input id="dispatchline_'+i+'_qty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.dispatchLineSetField('+i+',\'qty\',this.value)"></div>' +
-    '</div>';
-  if(line.productId){
-    const short = qty > (st?st.finished:0);
-    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Finished goods: <strong style="margin-left:4px;">'+(st?st.finished:0)+' cartons</strong>'+(short?' \u2014 not enough stock':'')+'</div>';
-  }
-  html += '</div>';
+    '</div>' + balanceHtml + '</div>';
   return html;
 }
 function viewDispatchList(){
@@ -1269,25 +1288,29 @@ function viewDispatchList(){
   let dispatches = s.transactions.filter(function(t){return t.type==='dispatch';}).sort(function(a,b){return b.ts-a.ts;});
   if(f.from) dispatches = dispatches.filter(function(t){return t.ts >= new Date(f.from).getTime();});
   if(f.to) dispatches = dispatches.filter(function(t){return t.ts <= new Date(f.to).getTime()+86399999;});
-  const totalCartons = dispatches.filter(function(t){return !t.voided;}).reduce(function(a,t){return a+t.qty;},0);
+  const live = dispatches.filter(function(t){return !t.voided;});
+  const totalCartons = live.filter(function(t){return (t.kind||'carton')==='carton';}).reduce(function(a,t){return a+t.qty;},0);
+  const totalLoose = live.filter(function(t){return (t.kind||'carton')==='loose';}).reduce(function(a,t){return a+t.qty;},0);
 
   html += '<div class="section-head"><h2>Dispatch report</h2>' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button></div>';
   html += '<div class="card" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:14px;">' +
     '<div class="field" style="margin-bottom:0;"><label>From</label><input type="date" value="'+escapeHtml(f.from)+'" onchange="App.actions.reportSetFrom(this.value)"></div>' +
     '<div class="field" style="margin-bottom:0;"><label>To</label><input type="date" value="'+escapeHtml(f.to)+'" onchange="App.actions.reportSetTo(this.value)"></div>' +
-    '<div class="hint" style="margin-bottom:9px;">Total dispatched in range: <strong class="mono">'+totalCartons+' cartons</strong></div>' +
+    '<div class="hint" style="margin-bottom:9px;">Total in range: <strong class="mono">'+totalCartons+' cartons</strong>'+(totalLoose>0?' + <strong class="mono">'+totalLoose+' loose pcs</strong>':'')+'</div>' +
     '<button class="btn btn-ghost btn-sm" style="margin-bottom:0;" onclick="App.actions.exportDispatchCSV()">Export CSV</button>' +
     '</div>';
 
   if(!dispatches.length){
-    html += emptyState('No dispatches yet', 'Dispatch a batch of complete cartons to see the report here.', '', '');
+    html += emptyState('No dispatches yet', 'Dispatch complete cartons or loose pieces to see the report here.', '', '');
   } else {
-    html += '<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Challan</th><th>Product</th><th>Cartons</th><th>Destination</th><th>Note</th><th></th></tr></thead><tbody>' +
+    html += '<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Challan</th><th>Product</th><th>Qty</th><th>Destination</th><th>Note</th><th></th></tr></thead><tbody>' +
       dispatches.map(function(t){
         const found = findSheetByTxnId(t.id);
+        const isLoose = (t.kind||'carton')==='loose';
         return '<tr><td>'+fmtDate(t.ts)+'</td><td>'+tag(t.challanNo)+(t.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
-          '<td>'+escapeHtml(finishedProductName(t.productId))+'</td><td class="mono">'+t.qty+'</td>' +
+          '<td>'+escapeHtml(isLoose?rawMaterialName(t.productId):finishedProductName(t.productId))+(isLoose?' <span class="pill pill-warn">loose</span>':'')+'</td>' +
+          '<td class="mono">'+t.qty+' '+(isLoose?'pcs':'ctn')+'</td>' +
           '<td>'+escapeHtml(t.destination||'\u2014')+'</td><td>'+escapeHtml(t.note||'\u2014')+'</td>' +
           '<td style="white-space:nowrap;">'+(found?'<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchViewSheet(\''+found.sheet.id+'\')">View</button> '+sheetVoidBtn(found.sheet,'dispatchVoidSheet'):'')+'</td></tr>';
       }).join('') + '</tbody></table></div>';
@@ -1313,8 +1336,9 @@ function viewDispatchNewSheet(){
   html += '<label style="display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Line items</label>';
   html += f.lines.map(function(l,i){return renderDispatchLineRow(l,i);}).join('');
   html += '<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchAddLine()">+ Add line</button>';
-  const total = f.lines.reduce(function(a,l){return a+(Number(l.qty)||0);},0);
-  html += '<div class="preview-box" style="margin-top:16px;">Grand total: <strong>'+total+'</strong> carton(s) across '+f.lines.length+' line(s)</div>';
+  const totalCtn = f.lines.reduce(function(a,l){return a+((l.kind||'carton')==='carton'?(Number(l.qty)||0):0);},0);
+  const totalLoosePcs = f.lines.reduce(function(a,l){return a+((l.kind||'carton')==='loose'?(Number(l.qty)||0):0);},0);
+  html += '<div class="preview-box" style="margin-top:16px;">Grand total: <strong>'+totalCtn+'</strong> carton(s)'+(totalLoosePcs>0?' + <strong>'+totalLoosePcs+'</strong> loose piece(s)':'')+' across '+f.lines.length+' line(s)</div>';
   html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:6px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.dispatchSubmitSheet()">'+(App.ui.busy?'Saving\u2026':'Confirm dispatch &amp; stamp')+'</button>';
   return html;
 }
@@ -1334,9 +1358,10 @@ function viewDispatchSheetDetail(sheetId){
     '<div style="margin:16px 0 10px;font-size:13px;">Date: <strong>'+escapeHtml(sh.date)+'</strong> &nbsp;\u00b7&nbsp; Challan: <strong>'+escapeHtml(sh.challanNo)+'</strong>' +
     (sh.destination?' &nbsp;\u00b7&nbsp; To: <strong>'+escapeHtml(sh.destination)+'</strong>':'') +
     (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + '</div>' +
-    '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Product</th><th>Cartons</th></tr></thead><tbody>' +
+    '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Product</th><th>Qty</th></tr></thead><tbody>' +
     sh.lines.map(function(l,i){
-      return '<tr><td>'+(i+1)+'</td><td>'+escapeHtml(finishedProductName(l.productId))+'</td><td class="mono">'+l.qty+'</td></tr>';
+      const isLoose = (l.kind||'carton')==='loose';
+      return '<tr><td>'+(i+1)+'</td><td>'+escapeHtml(isLoose?rawMaterialName(l.productId):finishedProductName(l.productId))+(isLoose?' (loose pieces)':'')+'</td><td class="mono">'+l.qty+' '+(isLoose?'pcs':'cartons')+'</td></tr>';
     }).join('') + '</tbody></table></div>' +
     (sh.note?'<div class="hint" style="margin-top:14px;">Note: '+escapeHtml(sh.note)+'</div>':'') +
     '</div>';
@@ -2222,7 +2247,12 @@ App.actions.dispatchNewSheet = function(){
 App.actions.dispatchCancelNew = function(){ App.ui.dispatchMode='list'; render(); };
 App.actions.dispatchSheetSetField = function(key, val){ App.ui.dispatchSheetForm[key] = val; render(); };
 App.actions.dispatchLineSetField = function(i, key, val){ App.ui.dispatchSheetForm.lines[i][key] = val; render(); };
-App.actions.dispatchAddLine = function(){ App.ui.dispatchSheetForm.lines.push({productId:'', qty:''}); render(); };
+App.actions.dispatchLineSetKind = function(i, kind){
+  const line = App.ui.dispatchSheetForm.lines[i];
+  if((line.kind||'carton') !== kind){ line.kind = kind; line.productId = ''; }
+  render();
+};
+App.actions.dispatchAddLine = function(){ App.ui.dispatchSheetForm.lines.push({kind:'carton', productId:'', qty:''}); render(); };
 App.actions.dispatchRemoveLine = function(i){
   const f = App.ui.dispatchSheetForm;
   f.lines.splice(i,1);
@@ -2233,15 +2263,19 @@ App.actions.dispatchSubmitSheet = async function(){
   if(App.ui.busy) return;
   const f = App.ui.dispatchSheetForm;
   if(!f.date) return toast('Select a date', 'err');
-  const validLines = f.lines.filter(function(l){ return l.productId && Number(l.qty)>0; });
+  const validLines = f.lines.filter(function(l){ return l.productId && Number(l.qty)>0; })
+    .map(function(l){ return {kind: l.kind||'carton', productId: l.productId, qty: Number(l.qty)}; });
   if(!validLines.length) return toast('Add at least one valid line item', 'err');
 
   const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
-  const uniqueProductIds = validLines.reduce(function(arr,l){ if(arr.indexOf(l.productId)===-1) arr.push(l.productId); return arr; }, []);
+  const uniqueFinishedIds = validLines.reduce(function(arr,l){ if(l.kind==='carton' && arr.indexOf(l.productId)===-1) arr.push(l.productId); return arr; }, []);
+  const uniqueRawIds = validLines.reduce(function(arr,l){ if(l.kind==='loose' && arr.indexOf(l.productId)===-1) arr.push(l.productId); return arr; }, []);
   const sheetRef = doc(collection(db,'dispatchSheets'));
   const txnRefs = validLines.map(function(){ return doc(collection(db,'transactions')); });
-  const stockRefs = {};
-  uniqueProductIds.forEach(function(pid){ stockRefs[pid] = doc(db,'finishedStock',pid); });
+  const finishedStockRefs = {};
+  uniqueFinishedIds.forEach(function(pid){ finishedStockRefs[pid] = doc(db,'finishedStock',pid); });
+  const rawStockRefs = {};
+  uniqueRawIds.forEach(function(pid){ rawStockRefs[pid] = doc(db,'stock',pid); });
 
   App.ui.busy = true;
   render();
@@ -2251,32 +2285,42 @@ App.actions.dispatchSubmitSheet = async function(){
       const claim = await claimChallanNumber(transaction, 'dispatch');
       const challanNo = claim.challanNo;
 
-      const stockData = {};
-      for(const pid of uniqueProductIds){
-        const snap = await transaction.get(stockRefs[pid]);
-        stockData[pid] = snap.exists() ? snap.data() : {finished:0};
+      const finishedRunning = {};
+      for(const pid of uniqueFinishedIds){
+        const snap = await transaction.get(finishedStockRefs[pid]);
+        finishedRunning[pid] = Object.assign({finished:0}, snap.exists() ? snap.data() : {});
       }
-      const running = {};
-      uniqueProductIds.forEach(function(pid){ running[pid] = Object.assign({}, stockData[pid]); });
+      const rawRunning = {};
+      for(const pid of uniqueRawIds){
+        const snap = await transaction.get(rawStockRefs[pid]);
+        rawRunning[pid] = Object.assign({refill:0, loose:0}, snap.exists() ? snap.data() : {});
+      }
 
       const txnIds = [];
       const linesOut = [];
       for(let i=0;i<validLines.length;i++){
         const line = validLines[i];
-        const qty = Number(line.qty);
-        if(qty > running[line.productId].finished) throw new Error('Not enough finished cartons for '+finishedProductName(line.productId));
-
-        running[line.productId].finished -= qty;
-
-        const txnData = buildTxnData('dispatch', line.productId, challanNo, f.note, ts, {qty: qty, destination: f.destination||''});
-        transaction.set(txnRefs[i], txnData);
-        txnIds.push(txnRefs[i].id);
-        transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRefs[i].id, ts, line.productId, 'finished', -qty, running[line.productId].finished, 'Dispatched', challanNo, txnData.user));
-
-        linesOut.push({productId: line.productId, qty: qty});
+        const qty = line.qty;
+        if(line.kind==='loose'){
+          if(qty > rawRunning[line.productId].loose) throw new Error('Not enough loose pieces for '+rawMaterialName(line.productId));
+          rawRunning[line.productId].loose -= qty;
+          const txnData = buildTxnData('dispatch', line.productId, challanNo, f.note, ts, {qty: qty, kind:'loose', destination: f.destination||''});
+          transaction.set(txnRefs[i], txnData);
+          txnIds.push(txnRefs[i].id);
+          transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRefs[i].id, ts, line.productId, 'loose', -qty, rawRunning[line.productId].loose, 'Dispatched \u2014 loose pieces', challanNo, txnData.user));
+        } else {
+          if(qty > finishedRunning[line.productId].finished) throw new Error('Not enough finished cartons for '+finishedProductName(line.productId));
+          finishedRunning[line.productId].finished -= qty;
+          const txnData = buildTxnData('dispatch', line.productId, challanNo, f.note, ts, {qty: qty, kind:'carton', destination: f.destination||''});
+          transaction.set(txnRefs[i], txnData);
+          txnIds.push(txnRefs[i].id);
+          transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRefs[i].id, ts, line.productId, 'finished', -qty, finishedRunning[line.productId].finished, 'Dispatched', challanNo, txnData.user));
+        }
+        linesOut.push({kind: line.kind, productId: line.productId, qty: qty});
       }
 
-      uniqueProductIds.forEach(function(pid){ transaction.set(stockRefs[pid], running[pid]); });
+      uniqueFinishedIds.forEach(function(pid){ transaction.set(finishedStockRefs[pid], finishedRunning[pid]); });
+      uniqueRawIds.forEach(function(pid){ transaction.set(rawStockRefs[pid], rawRunning[pid]); });
       transaction.set(sheetRef, {
         date: f.date, challanNo: challanNo, destination: f.destination||'', note: f.note||'',
         lines: linesOut, txnIds: txnIds,
@@ -2320,31 +2364,48 @@ App.actions.dispatchVoidSheet = async function(sheetId){
       const txnSnaps = [];
       for(const ref of txnRefs){ txnSnaps.push(await transaction.get(ref)); }
 
-      const uniqueProductIds = [];
-      txnSnaps.forEach(function(s){ if(s.exists()){ const pid=s.data().productId; if(uniqueProductIds.indexOf(pid)===-1) uniqueProductIds.push(pid); } });
-      const stockRefs = {}; const stockData = {};
-      for(const pid of uniqueProductIds){
-        stockRefs[pid] = doc(db,'finishedStock',pid);
-        const snap = await transaction.get(stockRefs[pid]);
-        stockData[pid] = snap.exists() ? snap.data() : {finished:0};
+      const uniqueFinishedIds = [];
+      const uniqueRawIds = [];
+      txnSnaps.forEach(function(s){
+        if(!s.exists()) return;
+        const t = s.data();
+        if((t.kind||'carton')==='loose'){ if(uniqueRawIds.indexOf(t.productId)===-1) uniqueRawIds.push(t.productId); }
+        else { if(uniqueFinishedIds.indexOf(t.productId)===-1) uniqueFinishedIds.push(t.productId); }
+      });
+      const finishedStockRefs = {}; const finishedRunning = {};
+      for(const pid of uniqueFinishedIds){
+        finishedStockRefs[pid] = doc(db,'finishedStock',pid);
+        const snap = await transaction.get(finishedStockRefs[pid]);
+        finishedRunning[pid] = Object.assign({finished:0}, snap.exists() ? snap.data() : {});
       }
-      const running = {};
-      uniqueProductIds.forEach(function(pid){ running[pid] = Object.assign({}, stockData[pid]); });
+      const rawStockRefs = {}; const rawRunning = {};
+      for(const pid of uniqueRawIds){
+        rawStockRefs[pid] = doc(db,'stock',pid);
+        const snap = await transaction.get(rawStockRefs[pid]);
+        rawRunning[pid] = Object.assign({refill:0, loose:0}, snap.exists() ? snap.data() : {});
+      }
 
       const reversalSteps = [];
       txnSnaps.forEach(function(s, i){
         if(!s.exists() || s.data().voided) return;
         const t = s.data();
-        running[t.productId].finished += t.qty;
-        reversalSteps.push({txnRef: txnRefs[i], productId: t.productId, t: t, snap:{finished: running[t.productId].finished}});
+        if((t.kind||'carton')==='loose'){
+          rawRunning[t.productId].loose += t.qty;
+          reversalSteps.push({txnRef: txnRefs[i], t: t, kind:'loose', balanceAfter: rawRunning[t.productId].loose});
+        } else {
+          finishedRunning[t.productId].finished += t.qty;
+          reversalSteps.push({txnRef: txnRefs[i], t: t, kind:'carton', balanceAfter: finishedRunning[t.productId].finished});
+        }
       });
 
       const reason = 'Void \u2014 Challan '+sheet.challanNo;
       reversalSteps.forEach(function(step){
         transaction.update(step.txnRef, {voided:true});
-        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'finished', step.t.qty, step.snap.finished, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+        const area = step.kind==='loose' ? 'loose' : 'finished';
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.t.productId, area, step.t.qty, step.balanceAfter, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
       });
-      uniqueProductIds.forEach(function(pid){ transaction.set(stockRefs[pid], running[pid]); });
+      uniqueFinishedIds.forEach(function(pid){ transaction.set(finishedStockRefs[pid], finishedRunning[pid]); });
+      uniqueRawIds.forEach(function(pid){ transaction.set(rawStockRefs[pid], rawRunning[pid]); });
       transaction.update(sheetRef, {voided:true});
     });
     toast('Dispatch voided', 'ok');
@@ -2386,9 +2447,10 @@ App.actions.exportLedgerCSV = function(){
   downloadBlob(csv, 'text/csv', 'packing-ledger.csv');
 };
 App.actions.exportDispatchCSV = function(){
-  const rows = [['Date','Challan','Product','Cartons','Destination','Note','Voided']];
+  const rows = [['Date','Challan','Product','Qty','Unit','Destination','Note','Voided']];
   App.state.transactions.filter(function(t){return t.type==='dispatch';}).sort(function(a,b){return a.ts-b.ts;}).forEach(function(t){
-    rows.push([fmtDate(t.ts), t.challanNo, finishedProductName(t.productId), t.qty, t.destination||'', t.note||'', t.voided?'Yes':'No']);
+    const isLoose = (t.kind||'carton')==='loose';
+    rows.push([fmtDate(t.ts), t.challanNo, isLoose?rawMaterialName(t.productId):finishedProductName(t.productId), t.qty, isLoose?'loose pcs':'cartons', t.destination||'', t.note||'', t.voided?'Yes':'No']);
   });
   const csv = rows.map(function(r){return r.map(function(c){return '"'+String(c).replace(/"/g,'""')+'"';}).join(',');}).join('\n');
   downloadBlob(csv, 'text/csv', 'dispatch-report.csv');

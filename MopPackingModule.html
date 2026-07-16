@@ -361,10 +361,11 @@ const TXN_LABELS = {
   refill_in:'Refill stock IN',
   pack:'Packed',
   loose_return:'Loose \u2192 Refill',
-  dispatch:'Dispatched'
+  dispatch:'Dispatched',
+  adjustment:'Stock adjusted'
 };
 
-const CHALLAN_PREFIX = { refill:'MI', pack:'PK', loose:'LR', dispatch:'DC' };
+const CHALLAN_PREFIX = { refill:'MI', pack:'PK', loose:'LR', dispatch:'DC', adjust:'ADJ' };
 function formatChallan(type, n){
   return CHALLAN_PREFIX[type] + '-' + String(n).padStart(4,'0');
 }
@@ -643,6 +644,14 @@ function lineValid(line){
 function editWindowMs(){
   return Number(App.state.meta.editWindowHours || 24) * 3600 * 1000;
 }
+/* Void window is computed dynamically from the record's creation time plus
+   the CURRENT Settings value -- not the frozen editableUntil stored on the
+   record. This way, raising the window in Settings retroactively re-opens
+   older entries for voiding (and lowering it closes them sooner). */
+function voidWindowOpen(rec){
+  const base = rec.createdAt || rec.ts || 0;
+  return Date.now() < base + editWindowMs();
+}
 function buildTxnData(type, productId, challanNo, note, ts, extra){
   return Object.assign({
     type: type, productId: productId, challanNo: challanNo, note: note||'',
@@ -751,7 +760,7 @@ function render(){
 
 /* ================= DASHBOARD ================= */
 function productNameForTxn(t){
-  return (t.type==='refill_in' || t.type==='loose_return') ? rawMaterialName(t.productId) : finishedProductName(t.productId);
+  return (t.type==='refill_in' || t.type==='loose_return' || t.type==='adjustment') ? rawMaterialName(t.productId) : finishedProductName(t.productId);
 }
 function viewDashboard(){
   const s = App.state;
@@ -860,10 +869,18 @@ function renderLineTableRow(line, i){
     '<td><button class="row-x" onclick="App.actions.refillRemoveLine('+i+')" title="Remove row">&times;</button></td>' +
     '</tr>';
 }
+/* Renders a small Void button for list rows, only while the sheet is voidable. */
+function sheetVoidBtn(sh, actionName){
+  if(sh.voided || !voidWindowOpen(sh)) return '';
+  return '<button class="btn btn-danger btn-sm" onclick="App.actions.'+actionName+'(\''+sh.id+'\')">Void</button>';
+}
 function viewRefillList(){
   const s = App.state;
   let html = '<div class="section-head"><h2>Refill stock (raw material)</h2>' +
-    '<button class="btn btn-primary" onclick="App.actions.refillNewSheet()">+ New material-in sheet (Step 1)</button></div>';
+    '<div style="display:flex;gap:8px;">' +
+    '<button class="btn btn-ghost btn-sm" onclick="App.actions.adjustOpenModal()">Adjust stock</button>' +
+    '<button class="btn btn-primary" onclick="App.actions.refillNewSheet()">+ New material-in sheet (Step 1)</button>' +
+    '</div></div>';
 
   if(!s.rawMaterials.length){
     return html + emptyState('No raw materials yet', 'Add a raw material in Settings first.', 'Go to Settings', "App.actions.nav('settings')");
@@ -884,7 +901,21 @@ function viewRefillList(){
         const total = sh.lines.reduce(function(sum,l){return sum+lineTotal(l);},0);
         return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
           '<td>'+escapeHtml(sh.sheetTitle||'\u2014')+'</td><td class="mono">'+sh.lines.length+'</td><td class="mono">'+total+'</td>' +
-          '<td><button class="btn btn-ghost btn-sm" onclick="App.actions.refillViewSheet(\''+sh.id+'\')">View</button></td></tr>';
+          '<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="App.actions.refillViewSheet(\''+sh.id+'\')">View</button> '+sheetVoidBtn(sh,'refillVoidSheet')+'</td></tr>';
+      }).join('') + '</tbody></table></div>';
+  }
+
+  const adjustments = s.transactions.filter(function(t){return t.type==='adjustment';}).sort(function(a,b){return b.ts-a.ts;}).slice(0,10);
+  if(adjustments.length){
+    html += '<div class="section-head" style="margin-top:24px;"><h2>Recent adjustments</h2></div>';
+    html += '<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Ref</th><th>Raw material</th><th>Adjustment</th><th>Reason</th><th>By</th><th></th></tr></thead><tbody>' +
+      adjustments.map(function(t){
+        const voidable = !t.voided && voidWindowOpen(t);
+        return '<tr><td>'+fmtDate(t.ts)+'</td><td>'+tag(t.challanNo)+(t.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
+          '<td>'+escapeHtml(rawMaterialName(t.productId))+'</td>' +
+          '<td class="mono '+(t.qty>=0?'delta-pos':'delta-neg')+'">'+(t.qty>=0?'+':'')+t.qty+' pcs</td>' +
+          '<td>'+escapeHtml(t.note||'\u2014')+'</td><td>'+escapeHtml(t.user)+'</td>' +
+          '<td>'+(voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.adjustVoid(\''+t.id+'\')">Void</button>':'')+'</td></tr>';
       }).join('') + '</tbody></table></div>';
   }
   return html;
@@ -927,7 +958,7 @@ function viewRefillSheetDetail(sheetId){
   const s = App.state;
   const sh = s.materialInSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
-  const voidable = !sh.voided && Date.now() < sh.editableUntil;
+  const voidable = !sh.voided && voidWindowOpen(sh);
 
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.refillBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
@@ -1043,7 +1074,7 @@ function viewPackList(){
         const loose = sh.lines.reduce(function(a,l){return a+(l.looseProduced||0);},0);
         return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
           '<td class="mono">'+sh.lines.length+'</td><td class="mono">'+cartons+'</td><td class="mono">'+loose+'</td>' +
-          '<td><button class="btn btn-ghost btn-sm" onclick="App.actions.packViewSheet(\''+sh.id+'\')">View</button></td></tr>';
+          '<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="App.actions.packViewSheet(\''+sh.id+'\')">View</button> '+sheetVoidBtn(sh,'packVoidSheet')+'</td></tr>';
       }).join('') + '</tbody></table></div>';
   }
   return html;
@@ -1073,7 +1104,7 @@ function viewPackSheetDetail(sheetId){
   const s = App.state;
   const sh = s.packingSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
-  const voidable = !sh.voided && Date.now() < sh.editableUntil;
+  const voidable = !sh.voided && voidWindowOpen(sh);
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.packBackToList()">\u2190 Back</button>' +
     (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.packVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') + '</div>';
   html += '<div class="card print-sheet">' +
@@ -1141,7 +1172,7 @@ function viewLooseList(){
         const total = sh.lines.reduce(function(a,l){return a+(Number(l.qty)||0);},0);
         return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
           '<td class="mono">'+sh.lines.length+'</td><td class="mono">'+total+'</td>' +
-          '<td><button class="btn btn-ghost btn-sm" onclick="App.actions.looseViewSheet(\''+sh.id+'\')">View</button></td></tr>';
+          '<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="App.actions.looseViewSheet(\''+sh.id+'\')">View</button> '+sheetVoidBtn(sh,'looseVoidSheet')+'</td></tr>';
       }).join('') + '</tbody></table></div>';
   }
   return html;
@@ -1170,7 +1201,7 @@ function viewLooseSheetDetail(sheetId){
   const s = App.state;
   const sh = s.looseReturnSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
-  const voidable = !sh.voided && Date.now() < sh.editableUntil;
+  const voidable = !sh.voided && voidWindowOpen(sh);
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.looseBackToList()">\u2190 Back</button>' +
     (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.looseVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') + '</div>';
   html += '<div class="card print-sheet">' +
@@ -1251,7 +1282,7 @@ function viewDispatchList(){
         return '<tr><td>'+fmtDate(t.ts)+'</td><td>'+tag(t.challanNo)+(t.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
           '<td>'+escapeHtml(finishedProductName(t.productId))+'</td><td class="mono">'+t.qty+'</td>' +
           '<td>'+escapeHtml(t.destination||'\u2014')+'</td><td>'+escapeHtml(t.note||'\u2014')+'</td>' +
-          '<td>'+(found?'<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchViewSheet(\''+found.sheet.id+'\')">View</button>':'')+'</td></tr>';
+          '<td style="white-space:nowrap;">'+(found?'<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchViewSheet(\''+found.sheet.id+'\')">View</button> '+sheetVoidBtn(found.sheet,'dispatchVoidSheet'):'')+'</td></tr>';
       }).join('') + '</tbody></table></div>';
   }
   return html;
@@ -1284,7 +1315,7 @@ function viewDispatchSheetDetail(sheetId){
   const s = App.state;
   const sh = s.dispatchSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
-  const voidable = !sh.voided && Date.now() < sh.editableUntil;
+  const voidable = !sh.voided && voidWindowOpen(sh);
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
@@ -1323,9 +1354,10 @@ function ledgerRowDepartment(r, txnTypeMap){
   if(type==='pack') return 'pack';
   if(type==='loose_return') return 'loose';
   if(type==='dispatch') return 'dispatch';
+  if(type==='adjustment') return 'adjust';
   return 'other';
 }
-const LEDGER_DEPARTMENT_LABELS = {refill:'Refill Stock', pack:'Pack', loose:'Loose Pieces', dispatch:'Dispatch', void:'Voided / reversal', other:'Other'};
+const LEDGER_DEPARTMENT_LABELS = {refill:'Refill Stock', pack:'Pack', loose:'Loose Pieces', dispatch:'Dispatch', adjust:'Adjustment', void:'Voided / reversal', other:'Other'};
 function ledgerProductOptions(selectedId){
   let html = '';
   if(App.state.rawMaterials.length){
@@ -1363,14 +1395,28 @@ function filteredLedgerRows(){
 }
 function ledgerTable(rows){
   const txnTypeMap = ledgerTxnTypeMap();
-  return '<div class="tbl-wrap"><table><thead><tr><th>When</th><th>Product</th><th>Department</th><th>Change</th><th>Balance</th><th>Reason</th><th>Challan</th><th>By</th></tr></thead><tbody>' +
+  return '<div class="tbl-wrap"><table><thead><tr><th>When</th><th>Product</th><th>Department</th><th class="mono" style="text-align:right;">In</th><th class="mono" style="text-align:right;">Out</th><th class="mono" style="text-align:right;">Balance</th><th>Reason</th><th>Challan</th><th>By</th></tr></thead><tbody>' +
     rows.map(function(r){
+      const inQty = r.delta>0 ? r.delta : null;
+      const outQty = r.delta<0 ? -r.delta : null;
       return '<tr><td>'+fmtDateTime(r.ts)+'</td><td>'+escapeHtml(productNameForArea(r.area, r.productId))+'</td>' +
         '<td>'+escapeHtml(LEDGER_DEPARTMENT_LABELS[ledgerRowDepartment(r, txnTypeMap)])+'</td>' +
-        '<td class="mono '+(r.delta>=0?'delta-pos':'delta-neg')+'">'+(r.delta>=0?'+':'')+r.delta+'</td>' +
-        '<td class="mono">'+r.balanceAfter+'</td><td>'+escapeHtml(r.reason)+'</td>' +
+        '<td class="mono delta-pos" style="text-align:right;">'+(inQty!==null?'+'+inQty:'\u2014')+'</td>' +
+        '<td class="mono delta-neg" style="text-align:right;">'+(outQty!==null?'\u2212'+outQty:'\u2014')+'</td>' +
+        '<td class="mono" style="text-align:right;font-weight:600;">'+r.balanceAfter+'</td><td>'+escapeHtml(r.reason)+'</td>' +
         '<td>'+tag(r.challanNo)+'</td><td>'+escapeHtml(r.user)+'</td></tr>';
     }).join('') + '</tbody></table></div>';
+}
+function ledgerSummary(rows){
+  let totalIn = 0, totalOut = 0;
+  rows.forEach(function(r){ if(r.delta>0) totalIn += r.delta; else totalOut += -r.delta; });
+  const net = totalIn - totalOut;
+  return '<div class="card" style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:14px;padding:14px 16px;">' +
+    '<div><div class="eyebrow">Total In</div><div class="disp delta-pos" style="font-size:20px;">+'+totalIn+'</div></div>' +
+    '<div><div class="eyebrow">Total Out</div><div class="disp delta-neg" style="font-size:20px;">\u2212'+totalOut+'</div></div>' +
+    '<div><div class="eyebrow">Net</div><div class="disp" style="font-size:20px;'+(net>=0?'':'color:var(--alert);')+'">'+(net>=0?'+':'\u2212')+Math.abs(net)+'</div></div>' +
+    '<div><div class="eyebrow">Entries</div><div class="disp" style="font-size:20px;">'+rows.length+'</div></div>' +
+    '</div>';
 }
 function viewLedger(){
   const f = App.ui.ledgerFilter;
@@ -1404,7 +1450,7 @@ function viewLedger(){
     html += emptyState('No matching ledger entries', 'Try widening your filters, or clear them with Reset.', '', '');
     return html;
   }
-  html += '<div class="hint" style="margin:-6px 0 10px;">'+rows.length+' entr'+(rows.length===1?'y':'ies')+'</div>';
+  html += ledgerSummary(rows);
   html += ledgerTable(rows);
   return html;
 }
@@ -1673,7 +1719,7 @@ App.actions.refillVoidSheet = async function(sheetId){
   const cached = App.state.materialInSheets.find(function(s){return s.id===sheetId;});
   if(!cached) return;
   if(cached.voided) return toast('Already voided', 'err');
-  if(Date.now() > cached.editableUntil) return toast('Void window has passed for this sheet', 'err');
+  if(!voidWindowOpen(cached)) return toast('Void window has passed for this sheet', 'err');
   if(!confirm('Void this entire material-in sheet (Challan '+cached.challanNo+')? This reverses all line credit(s).')) return;
 
   try{
@@ -1682,7 +1728,7 @@ App.actions.refillVoidSheet = async function(sheetId){
       if(!sheetSnap.exists()) throw new Error('Sheet not found');
       const sheet = sheetSnap.data();
       if(sheet.voided) throw new Error('Already voided');
-      if(Date.now() > sheet.editableUntil) throw new Error('Void window has passed for this sheet');
+      if(!voidWindowOpen(sheet)) throw new Error('Void window has passed for this sheet');
 
       const txnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
       const txnSnaps = [];
@@ -1727,6 +1773,97 @@ App.actions.refillVoidSheet = async function(sheetId){
     toast('Sheet voided', 'ok');
   }catch(e){
     toast(e.message || 'Failed to void sheet', 'err');
+  }
+};
+
+/* ---- Stock adjustments (recount corrections, raw material refill only) ---- */
+App.actions.adjustOpenModal = function(){
+  if(!App.state.rawMaterials.length) return toast('Add a raw material first (Settings)', 'err');
+  const body =
+    '<div class="field"><label>Raw material</label><select id="adjProductId">' +
+    '<option value="">Select\u2026</option>' + rawMaterialOptionsPlain('') + '</select></div>' +
+    '<div class="field"><label>Direction</label><select id="adjDirection">' +
+    '<option value="add">Add pieces (bag had more than entered)</option>' +
+    '<option value="remove">Remove pieces (bag had less than entered)</option>' +
+    '</select></div>' +
+    '<div class="field"><label>Quantity (pcs)</label><input id="adjQty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" placeholder="e.g. 5"></div>' +
+    '<div class="field"><label>Reason</label><input id="adjReason" placeholder="e.g. Recount \u2014 MI-0001 bag 4 was 235 not 240"></div>' +
+    '<div class="hint" style="margin-bottom:12px;">This posts a dated ADJ entry in the ledger. The original material-in sheet is not changed.</div>' +
+    '<button class="btn btn-primary" style="width:100%;justify-content:center;" onclick="App.actions.adjustSubmit()">Save adjustment</button>';
+  openModal('Adjust refill stock', body);
+};
+App.actions.adjustSubmit = async function(){
+  if(App.ui.busy) return;
+  const productId = document.getElementById('adjProductId').value;
+  const direction = document.getElementById('adjDirection').value;
+  const qtyRaw = Number(document.getElementById('adjQty').value);
+  const reason = document.getElementById('adjReason').value.trim();
+  if(!productId) return toast('Select a raw material', 'err');
+  if(!qtyRaw || qtyRaw<1) return toast('Enter a valid quantity', 'err');
+  if(!reason) return toast('Enter a reason \u2014 required for the record', 'err');
+  const delta = direction==='remove' ? -qtyRaw : qtyRaw;
+
+  const txnRef = doc(collection(db,'transactions'));
+  const stockRef = doc(db,'stock',productId);
+  const ts = Date.now();
+
+  App.ui.busy = true;
+  try{
+    let assignedRef = '';
+    await runTransaction(db, async function(transaction){
+      const claim = await claimChallanNumber(transaction, 'adjust');
+      const challanNo = claim.challanNo;
+      const snap = await transaction.get(stockRef);
+      const st = snap.exists() ? snap.data() : {refill:0, loose:0};
+      const newRefill = st.refill + delta;
+      if(newRefill < 0) throw new Error('Cannot remove '+qtyRaw+' pcs \u2014 only '+st.refill+' pcs in refill stock');
+
+      const txnData = buildTxnData('adjustment', productId, challanNo, reason, ts, {qty: delta});
+      transaction.set(txnRef, txnData);
+      transaction.set(stockRef, {refill: newRefill, loose: st.loose});
+      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, ts, productId, 'refill', delta, newRefill, 'Adjustment \u2014 '+reason, challanNo, txnData.user));
+      transaction.set(claim.counterRef, {last: claim.nextNum});
+      assignedRef = challanNo;
+    });
+    App.ui.busy = false;
+    closeModal();
+    toast('Adjustment saved as '+assignedRef, 'ok');
+    render();
+  }catch(e){
+    App.ui.busy = false;
+    toast(e.message || 'Adjustment failed', 'err');
+  }
+};
+
+App.actions.adjustVoid = async function(txnId){
+  const cached = App.state.transactions.find(function(t){return t.id===txnId;});
+  if(!cached) return;
+  if(cached.voided) return toast('Already voided', 'err');
+  if(!voidWindowOpen(cached)) return toast('Void window has passed for this adjustment', 'err');
+  if(!confirm('Void adjustment '+cached.challanNo+' ('+(cached.qty>=0?'+':'')+cached.qty+' pcs)? This reverses it.')) return;
+
+  const txnRef = doc(db,'transactions',txnId);
+  const stockRef = doc(db,'stock',cached.productId);
+  try{
+    await runTransaction(db, async function(transaction){
+      const txnSnap = await transaction.get(txnRef);
+      if(!txnSnap.exists()) throw new Error('Adjustment not found');
+      const t = txnSnap.data();
+      if(t.voided) throw new Error('Already voided');
+      if(!voidWindowOpen(t)) throw new Error('Void window has passed for this adjustment');
+
+      const snap = await transaction.get(stockRef);
+      const st = snap.exists() ? snap.data() : {refill:0, loose:0};
+      const newRefill = st.refill - t.qty;
+      if(newRefill < 0) throw new Error('Cannot void \u2014 stock has already been used');
+
+      transaction.update(txnRef, {voided:true});
+      transaction.set(stockRef, {refill: newRefill, loose: st.loose});
+      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, Date.now(), t.productId, 'refill', -t.qty, newRefill, 'Void \u2014 '+t.challanNo, t.challanNo, App.state.meta.currentUser||'Operator'));
+    });
+    toast('Adjustment voided', 'ok');
+  }catch(e){
+    toast(e.message || 'Failed to void adjustment', 'err');
   }
 };
 
@@ -1851,7 +1988,7 @@ App.actions.packVoidSheet = async function(sheetId){
   const cached = App.state.packingSheets.find(function(s){return s.id===sheetId;});
   if(!cached) return;
   if(cached.voided) return toast('Already voided', 'err');
-  if(Date.now() > cached.editableUntil) return toast('Void window has passed for this sheet', 'err');
+  if(!voidWindowOpen(cached)) return toast('Void window has passed for this sheet', 'err');
   if(!confirm('Void this entire packing sheet (Challan '+cached.challanNo+')? This reverses all line(s).')) return;
 
   const sheetRef = doc(db,'packingSheets',sheetId);
@@ -1861,7 +1998,7 @@ App.actions.packVoidSheet = async function(sheetId){
       if(!sheetSnap.exists()) throw new Error('Sheet not found');
       const sheet = sheetSnap.data();
       if(sheet.voided) throw new Error('Already voided');
-      if(Date.now() > sheet.editableUntil) throw new Error('Void window has passed for this sheet');
+      if(!voidWindowOpen(sheet)) throw new Error('Void window has passed for this sheet');
 
       const txnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
       const txnSnaps = [];
@@ -2016,7 +2153,7 @@ App.actions.looseVoidSheet = async function(sheetId){
   const cached = App.state.looseReturnSheets.find(function(s){return s.id===sheetId;});
   if(!cached) return;
   if(cached.voided) return toast('Already voided', 'err');
-  if(Date.now() > cached.editableUntil) return toast('Void window has passed for this sheet', 'err');
+  if(!voidWindowOpen(cached)) return toast('Void window has passed for this sheet', 'err');
   if(!confirm('Void this entire loose-return sheet (Challan '+cached.challanNo+')? This reverses all line(s).')) return;
 
   const sheetRef = doc(db,'looseReturnSheets',sheetId);
@@ -2026,7 +2163,7 @@ App.actions.looseVoidSheet = async function(sheetId){
       if(!sheetSnap.exists()) throw new Error('Sheet not found');
       const sheet = sheetSnap.data();
       if(sheet.voided) throw new Error('Already voided');
-      if(Date.now() > sheet.editableUntil) throw new Error('Void window has passed for this sheet');
+      if(!voidWindowOpen(sheet)) throw new Error('Void window has passed for this sheet');
 
       const txnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
       const txnSnaps = [];
@@ -2160,7 +2297,7 @@ App.actions.dispatchVoidSheet = async function(sheetId){
   const cached = App.state.dispatchSheets.find(function(s){return s.id===sheetId;});
   if(!cached) return;
   if(cached.voided) return toast('Already voided', 'err');
-  if(Date.now() > cached.editableUntil) return toast('Void window has passed for this sheet', 'err');
+  if(!voidWindowOpen(cached)) return toast('Void window has passed for this sheet', 'err');
   if(!confirm('Void this entire dispatch (Challan '+cached.challanNo+')? This reverses all line(s).')) return;
 
   const sheetRef = doc(db,'dispatchSheets',sheetId);
@@ -2170,7 +2307,7 @@ App.actions.dispatchVoidSheet = async function(sheetId){
       if(!sheetSnap.exists()) throw new Error('Sheet not found');
       const sheet = sheetSnap.data();
       if(sheet.voided) throw new Error('Already voided');
-      if(Date.now() > sheet.editableUntil) throw new Error('Void window has passed for this sheet');
+      if(!voidWindowOpen(sheet)) throw new Error('Void window has passed for this sheet');
 
       const txnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
       const txnSnaps = [];
@@ -2231,9 +2368,12 @@ function downloadBlob(content, mime, filename){
 }
 App.actions.exportLedgerCSV = function(){
   const txnTypeMap = ledgerTxnTypeMap();
-  const rows = [['When','Department','Area','Product','Change','Balance','Reason','Challan','By']];
+  const rows = [['When','Department','Area','Product','In','Out','Balance','Reason','Challan','By']];
   filteredLedgerRows().slice().sort(function(a,b){return a.ts-b.ts;}).forEach(function(r){
-    rows.push([fmtDateTime(r.ts), LEDGER_DEPARTMENT_LABELS[ledgerRowDepartment(r, txnTypeMap)], r.area, productNameForArea(r.area, r.productId), r.delta, r.balanceAfter, r.reason, r.challanNo, r.user]);
+    rows.push([
+      fmtDateTime(r.ts), LEDGER_DEPARTMENT_LABELS[ledgerRowDepartment(r, txnTypeMap)], r.area, productNameForArea(r.area, r.productId),
+      r.delta>0?r.delta:'', r.delta<0?-r.delta:'', r.balanceAfter, r.reason, r.challanNo, r.user
+    ]);
   });
   const csv = rows.map(function(r){return r.map(function(c){return '"'+String(c).replace(/"/g,'""')+'"';}).join(',');}).join('\n');
   downloadBlob(csv, 'text/csv', 'packing-ledger.csv');

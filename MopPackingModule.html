@@ -257,7 +257,7 @@
 </head>
 <body>
 
-<div class="app">
+<div class="app" id="appRoot">
   <aside class="rail" id="rail">
     <div class="rail-brand">
       <div class="disp">MOP PACKING</div>
@@ -279,6 +279,7 @@
   </div>
 </div>
 
+<div id="loginRoot" style="display:none;"></div>
 <div class="modal-root hidden" id="modalRoot"></div>
 <div class="toast-root" id="toastRoot"></div>
 
@@ -399,7 +400,8 @@ function defaultState(){
     materialInSheets:[],    // {id, date, challanNo, sheetTitle, receivedBy, verifiedBy, lines:[...], txnIds:[...], voided, editableUntil, createdAt}
     packingSheets:[],       // {id, date, challanNo, lines:[{rawMaterialId,finishedProductId,qty,cartonsProduced,looseProduced}], txnIds:[...], voided, editableUntil, createdAt}
     looseReturnSheets:[],   // {id, date, challanNo, lines:[{productId,qty}], txnIds:[...], voided, editableUntil, createdAt}
-    dispatchSheets:[]       // {id, date, challanNo, destination, note, lines:[{productId,qty}], txnIds:[...], voided, editableUntil, createdAt}
+    dispatchSheets:[],      // {id, date, challanNo, destination, note, lines:[{kind,productId,qty}], txnIds:[...], voided, editableUntil, createdAt}
+    users:[]                // {id, username, name, passwordHash, role:'admin'|'operator', active, createdAt}
   };
 }
 
@@ -409,6 +411,7 @@ const App = {
     ready:false,
     connectionError:null,
     busy:false, // true while a sheet save/void is in flight -- blocks re-submission
+    session:null, // {id, username, name, role} of the logged-in user, persisted in localStorage
     tab:'dashboard',
     refillMode:'list', // 'list' | 'new' | 'view'
     refillSheetForm:null,
@@ -441,7 +444,7 @@ const db = getFirestore(firebaseApp);
 try{ enableIndexedDbPersistence(db); }catch(e){ /* multiple tabs open, or unsupported browser -- fine, just skip offline cache */ }
 
 function attachListeners(){
-  const flags = {rawMaterials:false, finishedProducts:false, stock:false, finishedStock:false, transactions:false, materialInSheets:false, packingSheets:false, looseReturnSheets:false, dispatchSheets:false, ledger:false, meta:false};
+  const flags = {rawMaterials:false, finishedProducts:false, stock:false, finishedStock:false, transactions:false, materialInSheets:false, packingSheets:false, looseReturnSheets:false, dispatchSheets:false, ledger:false, meta:false, users:false};
   function checkReady(){
     if(!App.ui.ready && Object.keys(flags).every(function(k){return flags[k];})){
       App.ui.ready = true;
@@ -501,6 +504,22 @@ function attachListeners(){
   onSnapshot(collection(db,'ledger'), function(snap){
     App.state.ledger = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
     flags.ledger = true; checkReady();
+  }, function(err){ App.ui.connectionError = err.message; render(); });
+
+  onSnapshot(collection(db,'users'), function(snap){
+    App.state.users = snap.docs.map(function(d){return Object.assign({id:d.id}, d.data());});
+    // If the stored session's user was deleted or deactivated, force logout.
+    if(App.ui.session){
+      const u = App.state.users.find(function(x){return x.id===App.ui.session.id;});
+      if(App.state.users.length && (!u || u.active===false)){
+        App.ui.session = null;
+        try{ localStorage.removeItem('mop_session'); }catch(e){}
+      } else if(u){
+        // Keep session's name/role fresh if admin edited them.
+        App.ui.session.name = u.name; App.ui.session.role = u.role;
+      }
+    }
+    flags.users = true; checkReady();
   }, function(err){ App.ui.connectionError = err.message; render(); });
 
   onSnapshot(doc(db,'meta','settings'), function(snap){
@@ -658,7 +677,7 @@ function voidWindowOpen(rec){
 function buildTxnData(type, productId, challanNo, note, ts, extra){
   return Object.assign({
     type: type, productId: productId, challanNo: challanNo, note: note||'',
-    ts: ts, user: App.state.meta.currentUser||'Operator',
+    ts: ts, user: currentUserName(),
     editableUntil: Date.now() + editWindowMs(),
     voided:false
   }, extra||{});
@@ -692,14 +711,25 @@ function closeModal(){
 /* ---------------- nav / render shell ---------------- */
 function renderNav(){
   const nav = document.getElementById('railNav');
-  nav.innerHTML = NAV.map(function(n){
+  const items = NAV.filter(function(n){
+    if(isViewer()) return n.id==='ledger';
+    return n.id!=='settings' || isAdmin();
+  });
+  nav.innerHTML = items.map(function(n){
     return '<button class="rail-btn'+(App.ui.tab===n.id?' active':'')+'" onclick="App.actions.nav(\''+n.id+'\')">' +
       '<svg viewBox="0 0 24 24">'+ICONS[n.icon]+'</svg>' +
       '<span class="lbl">'+n.label+'</span>' +
       '<span class="lbl-s">'+n.short+'</span></button>';
   }).join('');
-  document.getElementById('topbarTitle').textContent = NAV.find(function(n){return n.id===App.ui.tab;}).label;
-  document.getElementById('topbarUser').textContent = (App.state.meta.currentUser||'Operator');
+  document.getElementById('topbarTitle').textContent = (NAV.find(function(n){return n.id===App.ui.tab;})||NAV[0]).label;
+  const tu = document.getElementById('topbarUser');
+  if(App.ui.session){
+    tu.innerHTML = escapeHtml(App.ui.session.name) +
+      ' <span class="pill '+(isAdmin()?'pill-warn':'pill-neutral')+'" style="margin:0 6px;">'+(isAdmin()?'Admin':(isViewer()?'Viewer':'Operator'))+'</span>' +
+      '<button class="btn btn-ghost btn-sm" onclick="App.actions.logout()">Logout</button>';
+  } else {
+    tu.textContent = '';
+  }
 }
 
 function render(){
@@ -739,6 +769,24 @@ function render(){
     return;
   }
 
+  // ---- login gate ----
+  const loginRoot = document.getElementById('loginRoot');
+  const appRoot = document.getElementById('appRoot');
+  if(!App.ui.session){
+    appRoot.style.display = 'none';
+    loginRoot.style.display = 'flex';
+    loginRoot.setAttribute('style','display:flex;position:fixed;inset:0;align-items:center;justify-content:center;background:var(--paper,#F4F1EA);z-index:40;padding:20px;');
+    loginRoot.innerHTML = renderLoginScreen();
+    return;
+  }
+  loginRoot.style.display = 'none';
+  loginRoot.innerHTML = '';
+  appRoot.style.display = '';
+
+  // Operators cannot open Settings; viewers can only open the Ledger.
+  if(isViewer() && App.ui.tab!=='ledger') App.ui.tab = 'ledger';
+  else if(App.ui.tab==='settings' && !isAdmin()) App.ui.tab = 'dashboard';
+
   const fn = {
     dashboard: viewDashboard,
     refill: viewRefill,
@@ -760,6 +808,107 @@ function render(){
     }
   }
 }
+
+/* ================= LOGIN / AUTH (app-level) =================
+   NOTE: this is an app-level login gate. Firestore itself is still
+   protected only by anonymous auth (rules: request.auth != null), so
+   this controls what honest users see and do -- it is NOT a hard
+   security boundary against someone technical who has the URL.       */
+async function sha256Hex(text){
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(buf)).map(function(b){return b.toString(16).padStart(2,'0');}).join('');
+}
+function isAdmin(){ return !!(App.ui.session && App.ui.session.role==='admin'); }
+function isViewer(){ return !!(App.ui.session && App.ui.session.role==='viewer'); }
+function currentUserName(){
+  return (App.ui.session && App.ui.session.name) || App.state.meta.currentUser || 'Operator';
+}
+function loadSession(){
+  try{
+    const raw = localStorage.getItem('mop_session');
+    if(raw) App.ui.session = JSON.parse(raw);
+  }catch(e){}
+}
+function renderLoginScreen(){
+  const companyName = App.state.meta.companyName || 'Royal Plastic';
+  const firstRun = !App.state.users.length;
+  let inner;
+  if(firstRun){
+    inner =
+      '<div class="eyebrow" style="margin-bottom:6px;">First-time setup</div>' +
+      '<h2 style="margin:0 0 4px;">Create the admin account</h2>' +
+      '<p class="hint" style="margin:0 0 16px;">No users exist yet. This account will manage all other users.</p>' +
+      '<div class="field"><label>Full name</label><input id="setupName" placeholder="e.g. Abdulqadir"></div>' +
+      '<div class="field"><label>Username</label><input id="setupUsername" autocapitalize="none" placeholder="e.g. admin"></div>' +
+      '<div class="field"><label>Password</label><input id="setupPassword" type="password"></div>' +
+      '<div class="field"><label>Confirm password</label><input id="setupPassword2" type="password"></div>' +
+      '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.setupFirstAdmin()">'+(App.ui.busy?'Creating\u2026':'Create admin account')+'</button>';
+  } else {
+    inner =
+      '<h2 style="margin:0 0 4px;">Sign in</h2>' +
+      '<p class="hint" style="margin:0 0 16px;">Only authorized users can access this system.</p>' +
+      '<div class="field"><label>Username</label><input id="loginUsername" autocapitalize="none" onkeydown="if(event.key===\'Enter\')document.getElementById(\'loginPassword\').focus()"></div>' +
+      '<div class="field"><label>Password</label><input id="loginPassword" type="password" onkeydown="if(event.key===\'Enter\')App.actions.loginSubmit()"></div>' +
+      '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.loginSubmit()">'+(App.ui.busy?'Checking\u2026':'Sign in')+'</button>';
+  }
+  return '<div class="card" style="width:100%;max-width:380px;padding:28px;">' +
+    '<div style="text-align:center;margin-bottom:18px;"><div class="disp" style="font-size:24px;">'+escapeHtml(companyName)+'</div>' +
+    '<div class="eyebrow" style="margin-top:4px;">Mop Packing \u00b7 Packing Department</div></div>' +
+    inner + '</div>';
+}
+App.actions.setupFirstAdmin = async function(){
+  if(App.ui.busy) return;
+  const name = document.getElementById('setupName').value.trim();
+  const username = document.getElementById('setupUsername').value.trim().toLowerCase();
+  const pw = document.getElementById('setupPassword').value;
+  const pw2 = document.getElementById('setupPassword2').value;
+  if(!name || !username) return toast('Enter name and username', 'err');
+  if(pw.length < 4) return toast('Password must be at least 4 characters', 'err');
+  if(pw !== pw2) return toast('Passwords do not match', 'err');
+  if(App.state.users.length) return toast('An account already exists \u2014 sign in instead', 'err');
+  App.ui.busy = true; render();
+  try{
+    const hash = await sha256Hex(pw);
+    const ref = doc(collection(db,'users'));
+    await setDoc(ref, {username: username, name: name, passwordHash: hash, role:'admin', active:true, createdAt: Date.now()});
+    App.ui.session = {id: ref.id, username: username, name: name, role:'admin'};
+    try{ localStorage.setItem('mop_session', JSON.stringify(App.ui.session)); }catch(e){}
+    App.ui.busy = false;
+    toast('Welcome, '+name, 'ok');
+    render();
+  }catch(e){
+    App.ui.busy = false;
+    toast('Setup failed: '+e.message, 'err');
+    render();
+  }
+};
+App.actions.loginSubmit = async function(){
+  if(App.ui.busy) return;
+  const username = document.getElementById('loginUsername').value.trim().toLowerCase();
+  const pw = document.getElementById('loginPassword').value;
+  if(!username || !pw) return toast('Enter username and password', 'err');
+  App.ui.busy = true; render();
+  try{
+    const hash = await sha256Hex(pw);
+    const u = App.state.users.find(function(x){return x.username===username;});
+    App.ui.busy = false;
+    if(!u || u.passwordHash !== hash){ toast('Wrong username or password', 'err'); render(); return; }
+    if(u.active === false){ toast('This account has been deactivated', 'err'); render(); return; }
+    App.ui.session = {id: u.id, username: u.username, name: u.name, role: u.role};
+    try{ localStorage.setItem('mop_session', JSON.stringify(App.ui.session)); }catch(e){}
+    toast('Welcome, '+u.name, 'ok');
+    render();
+  }catch(e){
+    App.ui.busy = false;
+    toast('Sign-in failed: '+e.message, 'err');
+    render();
+  }
+};
+App.actions.logout = function(){
+  App.ui.session = null;
+  try{ localStorage.removeItem('mop_session'); }catch(e){}
+  render();
+};
 
 /* ================= DASHBOARD ================= */
 function productNameForTxn(t){
@@ -875,14 +1024,14 @@ function renderLineTableRow(line, i){
 }
 /* Renders a small Void button for list rows, only while the sheet is voidable. */
 function sheetVoidBtn(sh, actionName){
-  if(sh.voided || !voidWindowOpen(sh)) return '';
+  if(!isAdmin() || sh.voided || !voidWindowOpen(sh)) return '';
   return '<button class="btn btn-danger btn-sm" onclick="App.actions.'+actionName+'(\''+sh.id+'\')">Void</button>';
 }
 function viewRefillList(){
   const s = App.state;
   let html = '<div class="section-head"><h2>Refill stock (raw material)</h2>' +
     '<div style="display:flex;gap:8px;">' +
-    '<button class="btn btn-ghost btn-sm" onclick="App.actions.adjustOpenModal()">Adjust stock</button>' +
+    (isAdmin()?'<button class="btn btn-ghost btn-sm" onclick="App.actions.adjustOpenModal()">Adjust stock</button>':'') +
     '<button class="btn btn-primary" onclick="App.actions.refillNewSheet()">+ New material-in sheet (Step 1)</button>' +
     '</div></div>';
 
@@ -914,7 +1063,7 @@ function viewRefillList(){
     html += '<div class="section-head" style="margin-top:24px;"><h2>Recent adjustments</h2></div>';
     html += '<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Ref</th><th>Raw material</th><th>Adjustment</th><th>Reason</th><th>By</th><th></th></tr></thead><tbody>' +
       adjustments.map(function(t){
-        const voidable = !t.voided && voidWindowOpen(t);
+        const voidable = isAdmin() && !t.voided && voidWindowOpen(t);
         return '<tr><td>'+fmtDate(t.ts)+'</td><td>'+tag(t.challanNo)+(t.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
           '<td>'+escapeHtml(rawMaterialName(t.productId))+'</td>' +
           '<td class="mono '+(t.qty>=0?'delta-pos':'delta-neg')+'">'+(t.qty>=0?'+':'')+t.qty+' pcs</td>' +
@@ -962,7 +1111,7 @@ function viewRefillSheetDetail(sheetId){
   const s = App.state;
   const sh = s.materialInSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
-  const voidable = !sh.voided && voidWindowOpen(sh);
+  const voidable = isAdmin() && !sh.voided && voidWindowOpen(sh);
 
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.refillBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
@@ -1108,7 +1257,7 @@ function viewPackSheetDetail(sheetId){
   const s = App.state;
   const sh = s.packingSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
-  const voidable = !sh.voided && voidWindowOpen(sh);
+  const voidable = isAdmin() && !sh.voided && voidWindowOpen(sh);
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.packBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
@@ -1207,7 +1356,7 @@ function viewLooseSheetDetail(sheetId){
   const s = App.state;
   const sh = s.looseReturnSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
-  const voidable = !sh.voided && voidWindowOpen(sh);
+  const voidable = isAdmin() && !sh.voided && voidWindowOpen(sh);
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.looseBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
@@ -1346,7 +1495,7 @@ function viewDispatchSheetDetail(sheetId){
   const s = App.state;
   const sh = s.dispatchSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
-  const voidable = !sh.voided && voidWindowOpen(sh);
+  const voidable = isAdmin() && !sh.voided && voidWindowOpen(sh);
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
@@ -1490,7 +1639,40 @@ function viewLedger(){
 /* ================= SETTINGS ================= */
 function viewSettings(){
   const s = App.state;
-  let html = '<div class="section-head"><h2>Raw Materials</h2></div>' +
+  let html = '<div class="section-head"><h2>Users</h2></div>' +
+    '<div class="card" style="margin-bottom:22px;">' +
+    '<div class="field-row">' +
+    '<div class="field" style="margin-bottom:0;"><label>Full name</label><input id="newUserName" placeholder="e.g. Kashif"></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Username</label><input id="newUserUsername" autocapitalize="none" placeholder="e.g. kashif"></div>' +
+    '</div>' +
+    '<div class="field-row">' +
+    '<div class="field" style="margin-bottom:0;"><label>Password</label><input id="newUserPassword" type="password"></div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Role</label><select id="newUserRole">' +
+    '<option value="operator">Operator \u2014 data entry only</option>' +
+    '<option value="viewer">Viewer \u2014 ledger view only</option>' +
+    '<option value="admin">Admin \u2014 full access</option>' +
+    '</select></div>' +
+    '</div>' +
+    '<button class="btn btn-primary" style="margin-top:4px;" onclick="App.actions.addUser()">Add user</button>';
+  if(s.users.length){
+    html += '<div class="tbl-wrap" style="margin-top:16px;"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>' +
+      s.users.map(function(u){
+        const me = App.ui.session && App.ui.session.id===u.id;
+        return '<tr><td>'+escapeHtml(u.name)+(me?' <span class="pill pill-warn">you</span>':'')+'</td>' +
+          '<td class="mono">'+escapeHtml(u.username)+'</td>' +
+          '<td>'+(u.role==='admin'?'Admin':(u.role==='viewer'?'Viewer':'Operator'))+'</td>' +
+          '<td>'+(u.active===false?'<span class="pill pill-neutral">deactivated</span>':'<span class="pill pill-warn">active</span>')+'</td>' +
+          '<td style="white-space:nowrap;">' +
+          '<button class="btn btn-ghost btn-sm" onclick="App.actions.resetUserPassword(\''+u.id+'\')">Reset password</button> ' +
+          (me?'':'<button class="btn btn-ghost btn-sm" onclick="App.actions.toggleUserActive(\''+u.id+'\')">'+(u.active===false?'Reactivate':'Deactivate')+'</button> ') +
+          (me?'':'<button class="btn btn-danger btn-sm" onclick="App.actions.deleteUser(\''+u.id+'\')">Delete</button>') +
+          '</td></tr>';
+      }).join('') + '</tbody></table></div>';
+  }
+  html += '<div class="hint" style="margin-top:10px;">Operators can enter sheets but cannot void, adjust stock, or open Settings. Admins can do everything including managing users.</div>';
+  html += '</div>';
+
+  html += '<div class="section-head"><h2>Raw Materials</h2></div>' +
     '<div class="card" style="margin-bottom:22px;">' +
     '<div class="field-row">' +
     '<div class="field" style="margin-bottom:0;"><label>Name</label><input id="newRawName" placeholder="e.g. Premium 16&quot; Refill"></div>' +
@@ -1539,8 +1721,7 @@ function viewSettings(){
     '<div class="field-row">' +
     '<div class="field"><label>Company name (shown on printed sheets)</label>' +
     '<input value="'+escapeHtml(s.meta.companyName||'')+'" onchange="App.actions.setCompanyName(this.value)"></div>' +
-    '<div class="field"><label>Your name (attached to ledger entries)</label>' +
-    '<input value="'+escapeHtml(s.meta.currentUser||'')+'" onchange="App.actions.setUserName(this.value)"></div>' +
+    '<div class="hint" style="margin-bottom:14px;">Ledger entries are attributed to the signed-in user automatically.</div>' +
     '</div>' +
     '<div class="field" style="max-width:200px;"><label>Void window (hours)</label>' +
     '<input type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+(s.meta.editWindowHours||24)+'" onchange="App.actions.setEditWindow(this.value)"></div>' +
@@ -1573,6 +1754,62 @@ function viewSettings(){
 
 /* ================= ACTIONS ================= */
 App.actions.nav = function(tab){ App.ui.tab = tab; render(); };
+
+/* ---- users (admin panel) ---- */
+function activeAdminCount(excludeId){
+  return App.state.users.filter(function(u){return u.role==='admin' && u.active!==false && u.id!==excludeId;}).length;
+}
+App.actions.addUser = async function(){
+  if(!isAdmin()) return toast('Only admins can manage users', 'err');
+  const name = document.getElementById('newUserName').value.trim();
+  const username = document.getElementById('newUserUsername').value.trim().toLowerCase();
+  const pw = document.getElementById('newUserPassword').value;
+  const role = document.getElementById('newUserRole').value;
+  if(!name || !username) return toast('Enter name and username', 'err');
+  if(pw.length < 4) return toast('Password must be at least 4 characters', 'err');
+  if(App.state.users.some(function(u){return u.username===username;})) return toast('That username is already taken', 'err');
+  try{
+    const hash = await sha256Hex(pw);
+    const ref = doc(collection(db,'users'));
+    await setDoc(ref, {username: username, name: name, passwordHash: hash, role: role, active:true, createdAt: Date.now()});
+    toast('User "'+name+'" added', 'ok');
+  }catch(e){ toast('Failed to add user: '+e.message, 'err'); }
+};
+App.actions.resetUserPassword = async function(id){
+  if(!isAdmin()) return toast('Only admins can manage users', 'err');
+  const u = App.state.users.find(function(x){return x.id===id;});
+  if(!u) return;
+  const pw = prompt('New password for '+u.name+':');
+  if(pw===null) return;
+  if(pw.length < 4) return toast('Password must be at least 4 characters', 'err');
+  try{
+    const hash = await sha256Hex(pw);
+    await setDoc(doc(db,'users',id), {passwordHash: hash}, {merge:true});
+    toast('Password updated for '+u.name, 'ok');
+  }catch(e){ toast('Failed: '+e.message, 'err'); }
+};
+App.actions.toggleUserActive = async function(id){
+  if(!isAdmin()) return toast('Only admins can manage users', 'err');
+  const u = App.state.users.find(function(x){return x.id===id;});
+  if(!u) return;
+  const deactivating = u.active!==false;
+  if(deactivating && u.role==='admin' && activeAdminCount(id)===0) return toast('Cannot deactivate the last admin', 'err');
+  try{
+    await setDoc(doc(db,'users',id), {active: !deactivating ? true : false}, {merge:true});
+    toast(u.name+' '+(deactivating?'deactivated':'reactivated'), 'ok');
+  }catch(e){ toast('Failed: '+e.message, 'err'); }
+};
+App.actions.deleteUser = async function(id){
+  if(!isAdmin()) return toast('Only admins can manage users', 'err');
+  const u = App.state.users.find(function(x){return x.id===id;});
+  if(!u) return;
+  if(u.role==='admin' && activeAdminCount(id)===0) return toast('Cannot delete the last admin', 'err');
+  if(!confirm('Delete user "'+u.name+'"? Their past entries stay in the records.')) return;
+  try{
+    await deleteDoc(doc(db,'users',id));
+    toast('User deleted', 'ok');
+  }catch(e){ toast('Failed: '+e.message, 'err'); }
+};
 
 /* ---- raw materials ---- */
 App.actions.addRawMaterial = async function(){
@@ -1657,6 +1894,7 @@ App.actions.refillRemoveLine = function(i){
 };
 App.actions.refillSubmitSheet = async function(){
   if(App.ui.busy) return;
+  if(isViewer()) return toast('Viewer accounts cannot enter data', 'err');
   const f = App.ui.refillSheetForm;
   if(!f.date) return toast('Select a date', 'err');
   const validLines = f.lines.filter(lineValid);
@@ -1749,6 +1987,7 @@ App.actions.refillPrintSheet = function(){ window.print(); };
 App.actions.refillVoidSheet = async function(sheetId){
   const sheetRef = doc(db,'materialInSheets',sheetId);
   const cached = App.state.materialInSheets.find(function(s){return s.id===sheetId;});
+  if(!isAdmin()) return toast('Only admins can void entries', 'err');
   if(!cached) return;
   if(cached.voided) return toast('Already voided', 'err');
   if(!voidWindowOpen(cached)) return toast('Void window has passed for this sheet', 'err');
@@ -1795,7 +2034,7 @@ App.actions.refillVoidSheet = async function(sheetId){
       reversalSteps.forEach(function(step){
         transaction.update(step.txnRef, {voided:true});
         const ledgerRef = doc(collection(db,'ledger'));
-        transaction.set(ledgerRef, buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'refill', -step.qty, step.balanceAfter, 'Void \u2014 Sheet Challan '+sheet.challanNo, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+        transaction.set(ledgerRef, buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'refill', -step.qty, step.balanceAfter, 'Void \u2014 Sheet Challan '+sheet.challanNo, sheet.challanNo, currentUserName()));
       });
       uniqueProductIds.forEach(function(pid){
         transaction.set(stockRefs[pid], Object.assign({}, stockData[pid], {refill: running[pid]}));
@@ -1810,6 +2049,7 @@ App.actions.refillVoidSheet = async function(sheetId){
 
 /* ---- Stock adjustments (recount corrections, raw material refill only) ---- */
 App.actions.adjustOpenModal = function(){
+  if(!isAdmin()) return toast('Only admins can adjust stock', 'err');
   if(!App.state.rawMaterials.length) return toast('Add a raw material first (Settings)', 'err');
   const body =
     '<div class="field"><label>Raw material</label><select id="adjProductId">' +
@@ -1826,6 +2066,7 @@ App.actions.adjustOpenModal = function(){
 };
 App.actions.adjustSubmit = async function(){
   if(App.ui.busy) return;
+  if(!isAdmin()) return toast('Only admins can adjust stock', 'err');
   const productId = document.getElementById('adjProductId').value;
   const direction = document.getElementById('adjDirection').value;
   const qtyRaw = Number(document.getElementById('adjQty').value);
@@ -1869,6 +2110,7 @@ App.actions.adjustSubmit = async function(){
 
 App.actions.adjustVoid = async function(txnId){
   const cached = App.state.transactions.find(function(t){return t.id===txnId;});
+  if(!isAdmin()) return toast('Only admins can void entries', 'err');
   if(!cached) return;
   if(cached.voided) return toast('Already voided', 'err');
   if(!voidWindowOpen(cached)) return toast('Void window has passed for this adjustment', 'err');
@@ -1891,7 +2133,7 @@ App.actions.adjustVoid = async function(txnId){
 
       transaction.update(txnRef, {voided:true});
       transaction.set(stockRef, {refill: newRefill, loose: st.loose});
-      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, Date.now(), t.productId, 'refill', -t.qty, newRefill, 'Void \u2014 '+t.challanNo, t.challanNo, App.state.meta.currentUser||'Operator'));
+      transaction.set(doc(collection(db,'ledger')), buildLedgerData(txnRef.id, Date.now(), t.productId, 'refill', -t.qty, newRefill, 'Void \u2014 '+t.challanNo, t.challanNo, currentUserName()));
     });
     toast('Adjustment voided', 'ok');
   }catch(e){
@@ -1918,6 +2160,7 @@ App.actions.packRemoveLine = function(i){
 };
 App.actions.packSubmitSheet = async function(){
   if(App.ui.busy) return;
+  if(isViewer()) return toast('Viewer accounts cannot enter data', 'err');
   const f = App.ui.packSheetForm;
   if(!f.date) return toast('Select a date', 'err');
   const validLines = f.lines.filter(function(l){ return l.finishedProductId && Number(l.qty)>0; });
@@ -2018,6 +2261,7 @@ App.actions.packViewSheet = function(id){ App.ui.tab = 'pack'; App.ui.viewingPac
 App.actions.packBackToList = function(){ App.ui.packMode = 'list'; render(); };
 App.actions.packVoidSheet = async function(sheetId){
   const cached = App.state.packingSheets.find(function(s){return s.id===sheetId;});
+  if(!isAdmin()) return toast('Only admins can void entries', 'err');
   if(!cached) return;
   if(cached.voided) return toast('Already voided', 'err');
   if(!voidWindowOpen(cached)) return toast('Void window has passed for this sheet', 'err');
@@ -2079,9 +2323,9 @@ App.actions.packVoidSheet = async function(sheetId){
       const reason = 'Void \u2014 Challan '+sheet.challanNo;
       reversalSteps.forEach(function(step){
         transaction.update(step.txnRef, {voided:true});
-        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.rawMaterialId, 'refill', step.t.qtyTaken, step.snap.refill, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
-        if(step.t.cartonsProduced>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.finishedProductId, 'finished', -step.t.cartonsProduced, step.snap.finished, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
-        if(step.t.looseProduced>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.rawMaterialId, 'loose', -step.t.looseProduced, step.snap.loose, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.rawMaterialId, 'refill', step.t.qtyTaken, step.snap.refill, reason, sheet.challanNo, currentUserName()));
+        if(step.t.cartonsProduced>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.finishedProductId, 'finished', -step.t.cartonsProduced, step.snap.finished, reason, sheet.challanNo, currentUserName()));
+        if(step.t.looseProduced>0) transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.rawMaterialId, 'loose', -step.t.looseProduced, step.snap.loose, reason, sheet.challanNo, currentUserName()));
       });
       uniqueRawIds.forEach(function(id){ transaction.set(rawStockRefs[id], rawRunning[id]); });
       uniqueFinishedIds.forEach(function(id){ transaction.set(finishedStockRefs[id], finishedRunning[id]); });
@@ -2183,6 +2427,7 @@ App.actions.looseViewSheet = function(id){ App.ui.tab = 'loose'; App.ui.viewingL
 App.actions.looseBackToList = function(){ App.ui.looseMode = 'list'; render(); };
 App.actions.looseVoidSheet = async function(sheetId){
   const cached = App.state.looseReturnSheets.find(function(s){return s.id===sheetId;});
+  if(!isAdmin()) return toast('Only admins can void entries', 'err');
   if(!cached) return;
   if(cached.voided) return toast('Already voided', 'err');
   if(!voidWindowOpen(cached)) return toast('Void window has passed for this sheet', 'err');
@@ -2225,8 +2470,8 @@ App.actions.looseVoidSheet = async function(sheetId){
       const reason = 'Void \u2014 Challan '+sheet.challanNo;
       reversalSteps.forEach(function(step){
         transaction.update(step.txnRef, {voided:true});
-        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'loose', step.t.qty, step.snap.loose, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
-        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'refill', -step.t.qty, step.snap.refill, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'loose', step.t.qty, step.snap.loose, reason, sheet.challanNo, currentUserName()));
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.productId, 'refill', -step.t.qty, step.snap.refill, reason, sheet.challanNo, currentUserName()));
       });
       uniqueProductIds.forEach(function(pid){ transaction.set(stockRefs[pid], running[pid]); });
       transaction.update(sheetRef, {voided:true});
@@ -2261,6 +2506,7 @@ App.actions.dispatchRemoveLine = function(i){
 };
 App.actions.dispatchSubmitSheet = async function(){
   if(App.ui.busy) return;
+  if(isViewer()) return toast('Viewer accounts cannot enter data', 'err');
   const f = App.ui.dispatchSheetForm;
   if(!f.date) return toast('Select a date', 'err');
   const validLines = f.lines.filter(function(l){ return l.productId && Number(l.qty)>0; })
@@ -2346,6 +2592,7 @@ App.actions.dispatchViewSheet = function(id){ App.ui.tab = 'dispatch'; App.ui.vi
 App.actions.dispatchBackToList = function(){ App.ui.dispatchMode = 'list'; render(); };
 App.actions.dispatchVoidSheet = async function(sheetId){
   const cached = App.state.dispatchSheets.find(function(s){return s.id===sheetId;});
+  if(!isAdmin()) return toast('Only admins can void entries', 'err');
   if(!cached) return;
   if(cached.voided) return toast('Already voided', 'err');
   if(!voidWindowOpen(cached)) return toast('Void window has passed for this sheet', 'err');
@@ -2402,7 +2649,7 @@ App.actions.dispatchVoidSheet = async function(sheetId){
       reversalSteps.forEach(function(step){
         transaction.update(step.txnRef, {voided:true});
         const area = step.kind==='loose' ? 'loose' : 'finished';
-        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.t.productId, area, step.t.qty, step.balanceAfter, reason, sheet.challanNo, App.state.meta.currentUser||'Operator'));
+        transaction.set(doc(collection(db,'ledger')), buildLedgerData(step.txnRef.id, Date.now(), step.t.productId, area, step.t.qty, step.balanceAfter, reason, sheet.challanNo, currentUserName()));
       });
       uniqueFinishedIds.forEach(function(pid){ transaction.set(finishedStockRefs[pid], finishedRunning[pid]); });
       uniqueRawIds.forEach(function(pid){ transaction.set(rawStockRefs[pid], rawRunning[pid]); });
@@ -2544,6 +2791,7 @@ App.actions.deleteProductionData = async function(){
 };
 
 /* ---------------- init ---------------- */
+loadSession();
 render(); // shows the "Connecting..." state immediately
 onAuthStateChanged(auth, function(user){
   if(user) attachListeners();

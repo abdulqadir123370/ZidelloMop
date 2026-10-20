@@ -416,15 +416,20 @@ const App = {
     refillMode:'list', // 'list' | 'new' | 'view'
     refillSheetForm:null,
     viewingRefillSheetId:null,
+    editingRefillSheetId:null,
+    editBase:{},
     packMode:'list',
     packSheetForm:null,
     viewingPackSheetId:null,
+    editingPackSheetId:null,
     looseMode:'list',
     looseSheetForm:null,
     viewingLooseSheetId:null,
+    editingLooseSheetId:null,
     dispatchMode:'list',
     dispatchSheetForm:null,
     viewingDispatchSheetId:null,
+    editingDispatchSheetId:null,
     ledgerFilter:{area:'all', department:'all', productId:'', user:'all', from:'', to:'', q:''},
     reportFilter:{from:'', to:''}
   },
@@ -632,7 +637,7 @@ function newSheetForm(){
   return {
     date: todayISO(),
     sheetTitle: App.state.meta.lastSheetTitle || '',
-    receivedBy: App.state.meta.currentUser || '',
+    receivedBy: (App.ui.session && App.ui.session.name) || '',   // the signed-in user, not the stale meta.currentUser default
     verifiedBy: '',
     lines: [newEmptyLine()]
   };
@@ -654,13 +659,42 @@ function lineLabel(line){
   }
   return escapeHtml(rawMaterialName(line.productId));
 }
-function lineValid(line){
-  if(line.mode==='mix'){
-    return line.productId && line.productIdB && line.productId!==line.productIdB &&
-      (Number(line.qtyA)>0 || Number(line.qtyB)>0) && Number(line.bags)>0;
+/* ---------- strict number entry ----------
+   Quantities are WHOLE numbers only. Number() happily accepts "2.5", "1e3", "0x10" or " 7 ",
+   and the forms used to silently DROP any row that wasn't fully valid -- so a typo could
+   save a sheet with a row missing. Now: untouched rows are ignored, but a touched row that
+   is incomplete or invalid blocks the save with a clear message. */
+const MAX_QTY = 99999999;
+function isBlank(v){ return v==null || String(v).trim()===''; }
+function isWhole(v){ return /^\s*\d+\s*$/.test(String(v==null?'':v)) && Number(v) <= MAX_QTY; }
+function isPosWhole(v){ return isWhole(v) && Number(v) > 0; }
+// 'empty' (untouched, ignored) | 'ok' | 'bad'
+function refillRowState(l){
+  if(l.mode==='mix'){
+    if(isBlank(l.productId) && isBlank(l.productIdB) && isBlank(l.qtyA) && isBlank(l.qtyB) && isBlank(l.bags)) return 'empty';
+    const a = isBlank(l.qtyA) ? 0 : (isWhole(l.qtyA) ? Number(l.qtyA) : -1);
+    const b = isBlank(l.qtyB) ? 0 : (isWhole(l.qtyB) ? Number(l.qtyB) : -1);
+    return (!isBlank(l.productId) && !isBlank(l.productIdB) && l.productId!==l.productIdB && a>=0 && b>=0 && (a>0||b>0) && isPosWhole(l.bags)) ? 'ok' : 'bad';
   }
-  return line.productId && Number(line.pcsPerBag)>0 && Number(line.bags)>0;
+  if(isBlank(l.productId) && isBlank(l.bags) && isBlank(l.pcsPerBag)) return 'empty';
+  return (!isBlank(l.productId) && isPosWhole(l.pcsPerBag) && isPosWhole(l.bags)) ? 'ok' : 'bad';
 }
+function qtyRowState(productField){
+  return function(l){
+    if(isBlank(l[productField]) && isBlank(l.qty)) return 'empty';
+    return (!isBlank(l[productField]) && isPosWhole(l.qty)) ? 'ok' : 'bad';
+  };
+}
+function checkRows(lines, stateFn){
+  const valid = [];
+  for(let i=0;i<lines.length;i++){
+    const st = stateFn(lines[i]);
+    if(st==='bad') return {error: 'Row '+(i+1)+' is incomplete or has an invalid number \u2014 use whole numbers only (no decimals, commas or letters), or clear the row.'};
+    if(st==='ok') valid.push(lines[i]);
+  }
+  return {valid: valid};
+}
+function lineValid(line){ return refillRowState(line)==='ok'; }
 
 /* ---------------- pure data builders (no side effects -- used inside Firestore transactions) ---------------- */
 function editWindowMs(){
@@ -677,17 +711,41 @@ function voidWindowOpen(rec){
 function buildTxnData(type, productId, challanNo, note, ts, extra){
   return Object.assign({
     type: type, productId: productId, challanNo: challanNo, note: note||'',
-    ts: ts, user: currentUserName(),
+    ts: ts, seq: nextLedgerSeq(), user: currentUserName(),
     editableUntil: Date.now() + editWindowMs(),
     voided:false
   }, extra||{});
 }
+// Monotonic write-order stamp for ledger rows (see ledgerOrdered below).
+let _ledgerSeq = 0;
+// Strictly increasing on this device (never wraps/repeats), anchored to wall-clock time.
+/* Newest entry first. Firestore returns documents in random id order, so rows that share a
+   date need a real tie-break: the write-order stamp (seq), then the challan number for
+   older records that predate it. */
+function newestFirst(a,b){
+  const ca = String(a.challanNo||''), cb = String(b.challanNo||'');
+  return (b.ts-a.ts) || ((b.seq||0)-(a.seq||0)) || (cb<ca?-1:cb>ca?1:0) || (String(b.id)<String(a.id)?-1:1);
+}
+function nextLedgerSeq(){ _ledgerSeq = Math.max(Date.now()*1000, _ledgerSeq + 1); return _ledgerSeq; }
 function buildLedgerData(txnId, ts, productId, area, delta, balanceAfter, reason, challanNo, user){
   return {
     txnId: txnId, ts: ts, productId: productId, area: area,
     delta: delta, balanceAfter: balanceAfter, reason: reason,
-    challanNo: challanNo, user: user
+    challanNo: challanNo, user: user, seq: nextLedgerSeq()
   };
+}
+/* Edits = undo the sheet's old effect + apply its new effect in ONE atomic
+   transaction. Only the FINAL balances matter: a transaction either commits
+   completely or aborts completely, so an edit must NOT be rejected merely
+   because the intermediate "undo" step would dip below zero (that wrongly
+   blocked valid edits, e.g. trimming a refill sheet after part of it was
+   already packed). Callers check the final buckets are >= 0. Ledger rows are
+   written credits-first, so no ledger row ever shows a negative balance. */
+function applyEditMoves(transaction, moves, ts, challanNo){
+  moves.filter(function(m){return m.delta>0;}).concat(moves.filter(function(m){return m.delta<0;})).forEach(function(m){
+    m.bucket[m.field] += m.delta;
+    transaction.set(doc(collection(db,'ledger')), buildLedgerData(m.txnId, ts, m.productId, m.area, m.delta, m.bucket[m.field], m.reason, challanNo, currentUserName()));
+  });
 }
 
 /* ---------------- modal ---------------- */
@@ -962,7 +1020,7 @@ function viewDashboard(){
       }).join('') + '</tbody></table></div>';
   }
 
-  const recent = s.transactions.slice().sort(function(a,b){return b.ts-a.ts;}).slice(0,10);
+  const recent = s.transactions.slice().sort(newestFirst).slice(0,10);
   html += '<div class="section-head"><h2>Recent activity</h2></div>';
   if(!recent.length){
     html += emptyState('No activity yet', 'Receive some refill stock to get started.', 'Receive stock', "App.actions.nav('refill')");
@@ -1027,6 +1085,26 @@ function sheetVoidBtn(sh, actionName){
   if(!isAdmin() || sh.voided || !voidWindowOpen(sh)) return '';
   return '<button class="btn btn-danger btn-sm" onclick="App.actions.'+actionName+'(\''+sh.id+'\')">Void</button>';
 }
+/* An edit rebuilds a sheet from its saved lines, so every product it refers to must still
+   exist. Sheets saved before the raw-material / finished-product split (or referring to a
+   since-removed product) can't be rebuilt safely -- say so clearly instead of failing midway. */
+function sheetEditable(kind, sh){
+  const raw = function(id){ return App.state.rawMaterials.some(function(p){return p.id===id;}); };
+  const fin = function(id){ return App.state.finishedProducts.some(function(p){return p.id===id;}); };
+  const okLines = (sh.lines||[]).every(function(l){
+    if(kind==='refill') return raw(l.productId) && (l.mode!=='mix' || raw(l.productIdB));
+    if(kind==='pack') return fin(l.finishedProductId) && raw(l.rawMaterialId);
+    if(kind==='loose') return raw(l.productId);
+    if(kind==='dispatch') return (l.kind||'carton')==='loose' ? raw(l.productId) : fin(l.productId);
+    return false;
+  });
+  if(!okLines) toast("This sheet uses products that no longer exist (it predates a catalog change), so it can't be edited \u2014 void it and enter it again.", 'err');
+  return okLines;
+}
+function sheetEditBtn(sh, actionName){
+  if(!isAdmin() || sh.voided || !voidWindowOpen(sh)) return '';
+  return '<button class="btn btn-ghost btn-sm" onclick="App.actions.'+actionName+'(\''+sh.id+'\')">Edit</button>';
+}
 function viewRefillList(){
   const s = App.state;
   let html = '<div class="section-head"><h2>Refill stock (raw material)</h2>' +
@@ -1052,13 +1130,13 @@ function viewRefillList(){
     html += '<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Challan</th><th>Title</th><th>Lines</th><th>Total pcs</th><th></th></tr></thead><tbody>' +
       sheets.map(function(sh){
         const total = sh.lines.reduce(function(sum,l){return sum+lineTotal(l);},0);
-        return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
+        return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+(sh.edited?' <span class="pill pill-warn">edited</span>':'')+'</td>' +
           '<td>'+escapeHtml(sh.sheetTitle||'\u2014')+'</td><td class="mono">'+sh.lines.length+'</td><td class="mono">'+total+'</td>' +
-          '<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="App.actions.refillViewSheet(\''+sh.id+'\')">View</button> '+sheetVoidBtn(sh,'refillVoidSheet')+'</td></tr>';
+          '<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="App.actions.refillViewSheet(\''+sh.id+'\')">View</button> '+sheetEditBtn(sh,'refillEditSheet')+' '+sheetVoidBtn(sh,'refillVoidSheet')+'</td></tr>';
       }).join('') + '</tbody></table></div>';
   }
 
-  const adjustments = s.transactions.filter(function(t){return t.type==='adjustment';}).sort(function(a,b){return b.ts-a.ts;}).slice(0,10);
+  const adjustments = s.transactions.filter(function(t){return t.type==='adjustment';}).sort(newestFirst).slice(0,10);
   if(adjustments.length){
     html += '<div class="section-head" style="margin-top:24px;"><h2>Recent adjustments</h2></div>';
     html += '<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Ref</th><th>Raw material</th><th>Adjustment</th><th>Reason</th><th>By</th><th></th></tr></thead><tbody>' +
@@ -1116,6 +1194,7 @@ function viewRefillSheetDetail(sheetId){
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.refillBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="App.actions.refillPrintSheet()">Print</button>' +
+    (voidable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.refillEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
     (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.refillVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') +
     '</div></div>';
 
@@ -1123,7 +1202,7 @@ function viewRefillSheetDetail(sheetId){
     '<div style="text-align:center;margin-bottom:4px;"><div class="disp" style="font-size:22px;">'+escapeHtml(s.meta.companyName||'Company')+'</div>' +
     (sh.sheetTitle?'<div class="eyebrow" style="margin-top:4px;">'+escapeHtml(sh.sheetTitle)+'</div>':'') + '</div>' +
     '<div style="margin:16px 0 10px;font-size:13px;">Date: <strong>'+escapeHtml(sh.date)+'</strong> &nbsp;\u00b7&nbsp; Challan: <strong>'+escapeHtml(sh.challanNo)+'</strong>' +
-    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + '</div>' +
+    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + (sh.edited?' <span class="pill pill-warn">EDITED</span>':'') + '</div>' +
     '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Item Name</th><th>PCS/BAG</th><th>Bags</th><th>Total Pieces</th></tr></thead><tbody>' +
     sh.lines.map(function(l,i){
       return '<tr><td>'+(i+1)+'</td><td>'+lineLabel(l)+'</td><td class="mono">'+linePcsPerBag(l)+'</td><td class="mono">'+l.bags+'</td><td class="mono">'+lineTotal(l)+'</td></tr>';
@@ -1135,8 +1214,41 @@ function viewRefillSheetDetail(sheetId){
     '</div>';
   return html;
 }
+function viewRefillEditSheet(){
+  const s = App.state;
+  const f = App.ui.refillSheetForm;
+  const sh = s.materialInSheets.find(function(x){return x.id===App.ui.editingRefillSheetId;});
+  if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  const grandTotal = f.lines.reduce(function(sum,l){return sum+lineTotal(l);},0);
+
+  let html = '<div class="section-head"><h2>Edit material-in sheet \u2014 Challan '+escapeHtml(sh.challanNo)+'</h2>' +
+    '<button class="btn btn-ghost btn-sm" onclick="App.actions.refillCancelEdit()">Cancel</button></div>';
+
+  html += '<div class="card" style="margin-bottom:16px;">' +
+    '<div class="field" style="max-width:220px;"><label>Date</label><input type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.refillSheetSetField(\'date\',this.value)"></div>' +
+    '<div class="hint" style="margin:-8px 0 13px;">Editing keeps the same challan number. Stock is recalculated and the change is recorded in the ledger.</div>' +
+    '<div class="field"><label>Sheet title (optional)</label><input id="refillEdit_sheetTitle" value="'+escapeHtml(f.sheetTitle)+'" oninput="App.actions.refillSheetSetField(\'sheetTitle\',this.value)"></div>' +
+    '<div class="field-row">' +
+    '<div class="field"><label>Received by</label><input id="refillEdit_receivedBy" value="'+escapeHtml(f.receivedBy)+'" oninput="App.actions.refillSheetSetField(\'receivedBy\',this.value)"></div>' +
+    '<div class="field"><label>Verified by</label><input id="refillEdit_verifiedBy" value="'+escapeHtml(f.verifiedBy)+'" oninput="App.actions.refillSheetSetField(\'verifiedBy\',this.value)"></div>' +
+    '</div>' +
+    '</div>';
+
+  html += '<label style="display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Line items</label>';
+  html += '<div class="tbl-wrap" style="margin-bottom:10px;"><table><thead><tr>' +
+    '<th>S.No</th><th>Item Name</th><th>PCS/BAG</th><th>Bags</th><th>Total Pieces</th><th></th>' +
+    '</tr></thead><tbody>' +
+    f.lines.map(function(l,i){return renderLineTableRow(l,i);}).join('') +
+    '</tbody></table></div>';
+  html += '<button class="btn btn-ghost btn-sm" onclick="App.actions.refillAddLine()">+ Add row</button>';
+
+  html += '<div class="preview-box" style="margin-top:16px;">Grand total: <strong>'+grandTotal+'</strong> pieces across '+f.lines.length+' line(s)</div>';
+  html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:6px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.refillSubmitEdit()">'+(App.ui.busy?'Saving\u2026':'Save changes')+'</button>';
+  return html;
+}
 function viewRefill(){
   if(App.ui.refillMode==='new') return viewRefillNewSheet();
+  if(App.ui.refillMode==='edit') return viewRefillEditSheet();
   if(App.ui.refillMode==='view') return viewRefillSheetDetail(App.ui.viewingRefillSheetId);
   return viewRefillList();
 }
@@ -1168,6 +1280,17 @@ function packLineLoose(line){
   const qty = Number(line.qty)||0;
   return size ? (qty % size) : 0;
 }
+// While editing an existing pack sheet, the save will first reverse this
+// sheet's OLD effect before reapplying the new one. The on-screen balance
+// must reflect that reversal too, or it looks short when it won't be.
+function packEditRawReversalRefill(rawMaterialId){
+  if(App.ui.packMode !== 'edit') return 0;
+  const sh = App.state.packingSheets.find(function(x){return x.id===App.ui.editingPackSheetId;});
+  if(!sh) return 0;
+  let delta = 0;
+  sh.lines.forEach(function(l){ if(l.rawMaterialId===rawMaterialId) delta += l.qty; });
+  return delta;
+}
 function packLineReservedBySiblings(i){
   const f = App.ui.packSheetForm;
   const line = f.lines[i];
@@ -1183,7 +1306,7 @@ function renderPackLineRow(line, i){
   const rawId = packLineRawMaterialId(line);
   const cartonSize = packLineCartonSize(line);
   const qty = Number(line.qty)||0;
-  const rawBalance = rawId ? rawStockFor(rawId).refill : 0;
+  const rawBalance = rawId ? (rawStockFor(rawId).refill + packEditRawReversalRefill(rawId)) : 0;
   const reserved = line.finishedProductId ? packLineReservedBySiblings(i) : 0;
   const availBalance = rawBalance - reserved;
   let html = '<div class="card" style="margin-bottom:10px;">' +
@@ -1225,9 +1348,9 @@ function viewPackList(){
       sheets.map(function(sh){
         const cartons = sh.lines.reduce(function(a,l){return a+(l.cartonsProduced||0);},0);
         const loose = sh.lines.reduce(function(a,l){return a+(l.looseProduced||0);},0);
-        return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
+        return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+(sh.edited?' <span class="pill pill-warn">edited</span>':'')+'</td>' +
           '<td class="mono">'+sh.lines.length+'</td><td class="mono">'+cartons+'</td><td class="mono">'+loose+'</td>' +
-          '<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="App.actions.packViewSheet(\''+sh.id+'\')">View</button> '+sheetVoidBtn(sh,'packVoidSheet')+'</td></tr>';
+          '<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="App.actions.packViewSheet(\''+sh.id+'\')">View</button> '+sheetEditBtn(sh,'packEditSheet')+' '+sheetVoidBtn(sh,'packVoidSheet')+'</td></tr>';
       }).join('') + '</tbody></table></div>';
   }
   return html;
@@ -1261,12 +1384,13 @@ function viewPackSheetDetail(sheetId){
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.packBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
+    (voidable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.packEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
     (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.packVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') + '</div></div>';
   html += '<div class="card print-sheet">' +
     '<div style="text-align:center;margin-bottom:4px;"><div class="disp" style="font-size:22px;">'+escapeHtml(s.meta.companyName||'Company')+'</div>' +
     '<div class="eyebrow" style="margin-top:4px;">Packing Sheet</div></div>' +
     '<div style="margin:16px 0 10px;font-size:13px;">Date: <strong>'+escapeHtml(sh.date)+'</strong> &nbsp;\u00b7&nbsp; Challan: <strong>'+escapeHtml(sh.challanNo)+'</strong>' +
-    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + '</div>' +
+    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + (sh.edited?' <span class="pill pill-warn">EDITED</span>':'') + '</div>' +
     '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Finished product</th><th>Raw material</th><th>Qty packed</th><th>Cartons</th><th>Loose</th></tr></thead><tbody>' +
     sh.lines.map(function(l,i){
       return '<tr><td>'+(i+1)+'</td><td>'+escapeHtml(finishedProductName(l.finishedProductId))+'</td><td>'+escapeHtml(rawMaterialName(l.rawMaterialId))+'</td><td class="mono">'+l.qty+'</td>' +
@@ -1275,8 +1399,29 @@ function viewPackSheetDetail(sheetId){
     '</div>';
   return html;
 }
+function viewPackEditSheet(){
+  const s = App.state;
+  const f = App.ui.packSheetForm;
+  const sh = s.packingSheets.find(function(x){return x.id===App.ui.editingPackSheetId;});
+  if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  let html = '<div class="section-head"><h2>Edit packing sheet \u2014 Challan '+escapeHtml(sh.challanNo)+'</h2>' +
+    '<button class="btn btn-ghost btn-sm" onclick="App.actions.packCancelEdit()">Cancel</button></div>';
+  html += '<div class="card" style="margin-bottom:16px;max-width:220px;">' +
+    '<div class="field" style="margin-bottom:0;"><label>Date</label><input type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.packSheetSetDate(this.value)"></div>' +
+    '</div>';
+  html += '<div class="hint" style="margin:-10px 0 13px;">Editing keeps the same challan number. Stock is recalculated from the new lines, and the change is recorded in the ledger.</div>';
+  html += '<label style="display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Line items</label>';
+  html += f.lines.map(function(l,i){return renderPackLineRow(l,i);}).join('');
+  html += '<button class="btn btn-ghost btn-sm" onclick="App.actions.packAddLine()">+ Add line</button>';
+  const totalCartons = f.lines.reduce(function(a,l){return a+packLineCartons(l);},0);
+  const totalLoose = f.lines.reduce(function(a,l){return a+packLineLoose(l);},0);
+  html += '<div class="preview-box" style="margin-top:16px;">Grand total: <strong>'+totalCartons+'</strong> carton(s) + <strong>'+totalLoose+'</strong> loose piece(s) across '+f.lines.length+' line(s)</div>';
+  html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:6px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.packSubmitEdit()">'+(App.ui.busy?'Saving\u2026':'Save changes')+'</button>';
+  return html;
+}
 function viewPack(){
   if(App.ui.packMode==='new') return viewPackNewSheet();
+  if(App.ui.packMode==='edit') return viewPackEditSheet();
   if(App.ui.packMode==='view') return viewPackSheetDetail(App.ui.viewingPackSheetId);
   return viewPackList();
 }
@@ -1285,9 +1430,21 @@ function viewPack(){
 function newLooseSheetForm(){
   return { date: todayISO(), lines: [{productId:'', qty:''}] };
 }
+// While editing an existing loose-return sheet, the save will first reverse
+// this sheet's OLD effect (giving pieces back to loose) before reapplying
+// the new one -- the balance hint must reflect that reversal too.
+function looseEditReversalLoose(productId){
+  if(App.ui.looseMode !== 'edit') return 0;
+  const sh = App.state.looseReturnSheets.find(function(x){return x.id===App.ui.editingLooseSheetId;});
+  if(!sh) return 0;
+  let delta = 0;
+  sh.lines.forEach(function(l){ if(l.productId===productId) delta += l.qty; });
+  return delta;
+}
 function renderLooseLineRow(line, i){
   const st = line.productId ? rawStockFor(line.productId) : null;
   const qty = Number(line.qty)||0;
+  const looseBalance = (st?st.loose:0) + (line.productId ? looseEditReversalLoose(line.productId) : 0);
   let html = '<div class="card" style="margin-bottom:10px;">' +
     '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">' +
     '<div class="eyebrow">Line '+(i+1)+'</div>' +
@@ -1299,8 +1456,8 @@ function renderLooseLineRow(line, i){
     '<input id="looseline_'+i+'_qty" type="text" inputmode="numeric" pattern="[0-9]*" class="mono" value="'+escapeHtml(line.qty)+'" oninput="App.actions.looseLineSetField('+i+',\'qty\',this.value)"></div>' +
     '</div>';
   if(line.productId){
-    const short = qty > (st?st.loose:0);
-    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Loose balance: <strong style="margin-left:4px;">'+(st?st.loose:0)+' pcs</strong>'+(short?' \u2014 not enough loose pieces':'')+'</div>';
+    const short = qty > looseBalance;
+    html += '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Loose balance: <strong style="margin-left:4px;">'+looseBalance+' pcs</strong>'+(short?' \u2014 not enough loose pieces':'')+'</div>';
   }
   html += '</div>';
   return html;
@@ -1325,9 +1482,9 @@ function viewLooseList(){
     html += '<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Challan</th><th>Lines</th><th>Total pcs</th><th></th></tr></thead><tbody>' +
       sheets.map(function(sh){
         const total = sh.lines.reduce(function(a,l){return a+(Number(l.qty)||0);},0);
-        return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
+        return '<tr><td>'+escapeHtml(sh.date)+'</td><td>'+tag(sh.challanNo)+(sh.voided?' <span class="pill pill-neutral">voided</span>':'')+(sh.edited?' <span class="pill pill-warn">edited</span>':'')+'</td>' +
           '<td class="mono">'+sh.lines.length+'</td><td class="mono">'+total+'</td>' +
-          '<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="App.actions.looseViewSheet(\''+sh.id+'\')">View</button> '+sheetVoidBtn(sh,'looseVoidSheet')+'</td></tr>';
+          '<td style="white-space:nowrap;"><button class="btn btn-ghost btn-sm" onclick="App.actions.looseViewSheet(\''+sh.id+'\')">View</button> '+sheetEditBtn(sh,'looseEditSheet')+' '+sheetVoidBtn(sh,'looseVoidSheet')+'</td></tr>';
       }).join('') + '</tbody></table></div>';
   }
   return html;
@@ -1360,12 +1517,13 @@ function viewLooseSheetDetail(sheetId){
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.looseBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
+    (voidable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.looseEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
     (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.looseVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') + '</div></div>';
   html += '<div class="card print-sheet">' +
     '<div style="text-align:center;margin-bottom:4px;"><div class="disp" style="font-size:22px;">'+escapeHtml(s.meta.companyName||'Company')+'</div>' +
     '<div class="eyebrow" style="margin-top:4px;">Loose-Return Sheet</div></div>' +
     '<div style="margin:16px 0 10px;font-size:13px;">Date: <strong>'+escapeHtml(sh.date)+'</strong> &nbsp;\u00b7&nbsp; Challan: <strong>'+escapeHtml(sh.challanNo)+'</strong>' +
-    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + '</div>' +
+    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + (sh.edited?' <span class="pill pill-warn">EDITED</span>':'') + '</div>' +
     '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Raw material</th><th>Qty returned</th></tr></thead><tbody>' +
     sh.lines.map(function(l,i){
       return '<tr><td>'+(i+1)+'</td><td>'+escapeHtml(rawMaterialName(l.productId))+'</td><td class="mono">'+l.qty+'</td></tr>';
@@ -1373,8 +1531,28 @@ function viewLooseSheetDetail(sheetId){
     '</div>';
   return html;
 }
+function viewLooseEditSheet(){
+  const s = App.state;
+  const f = App.ui.looseSheetForm;
+  const sh = s.looseReturnSheets.find(function(x){return x.id===App.ui.editingLooseSheetId;});
+  if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  let html = '<div class="section-head"><h2>Edit loose-return sheet \u2014 Challan '+escapeHtml(sh.challanNo)+'</h2>' +
+    '<button class="btn btn-ghost btn-sm" onclick="App.actions.looseCancelEdit()">Cancel</button></div>';
+  html += '<div class="card" style="margin-bottom:16px;max-width:220px;">' +
+    '<div class="field" style="margin-bottom:0;"><label>Date</label><input type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.looseSheetSetDate(this.value)"></div>' +
+    '</div>';
+  html += '<div class="hint" style="margin:-10px 0 13px;">Editing keeps the same challan number. Stock is recalculated and the change is recorded in the ledger.</div>';
+  html += '<label style="display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Line items</label>';
+  html += f.lines.map(function(l,i){return renderLooseLineRow(l,i);}).join('');
+  html += '<button class="btn btn-ghost btn-sm" onclick="App.actions.looseAddLine()">+ Add line</button>';
+  const total = f.lines.reduce(function(a,l){return a+(Number(l.qty)||0);},0);
+  html += '<div class="preview-box" style="margin-top:16px;">Grand total: <strong>'+total+'</strong> pieces across '+f.lines.length+' line(s)</div>';
+  html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:6px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.looseSubmitEdit()">'+(App.ui.busy?'Saving\u2026':'Save changes')+'</button>';
+  return html;
+}
 function viewLoose(){
   if(App.ui.looseMode==='new') return viewLooseNewSheet();
+  if(App.ui.looseMode==='edit') return viewLooseEditSheet();
   if(App.ui.looseMode==='view') return viewLooseSheetDetail(App.ui.viewingLooseSheetId);
   return viewLooseList();
 }
@@ -1382,6 +1560,17 @@ function viewLoose(){
 /* ================= DISPATCH (multi-line sheet) ================= */
 function newDispatchSheetForm(){
   return { date: todayISO(), destination:'', note:'', lines: [{kind:'carton', productId:'', qty:''}] };
+}
+// While editing an existing dispatch sheet, the save will first reverse this
+// sheet's OLD effect (giving cartons/pieces back) before reapplying the new
+// one -- the balance hint must reflect that reversal too.
+function dispatchEditReversal(productId, kind){
+  if(App.ui.dispatchMode !== 'edit') return 0;
+  const sh = App.state.dispatchSheets.find(function(x){return x.id===App.ui.editingDispatchSheetId;});
+  if(!sh) return 0;
+  let delta = 0;
+  sh.lines.forEach(function(l){ if(l.productId===productId && (l.kind||'carton')===kind) delta += l.qty; });
+  return delta;
 }
 function renderDispatchLineRow(line, i){
   const kind = line.kind || 'carton';
@@ -1392,7 +1581,7 @@ function renderDispatchLineRow(line, i){
       '<option value="">Select\u2026</option>' + rawMaterialOptionsPlain(line.productId) + '</select></div>';
     qtyLabel = 'Loose pieces to dispatch';
     if(line.productId){
-      const bal = rawStockFor(line.productId).loose;
+      const bal = rawStockFor(line.productId).loose + dispatchEditReversal(line.productId, 'loose');
       const short = qty > bal;
       balanceHtml = '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Loose pieces: <strong style="margin-left:4px;">'+bal+' pcs</strong>'+(short?' \u2014 not enough stock':'')+'</div>';
     }
@@ -1401,7 +1590,7 @@ function renderDispatchLineRow(line, i){
       '<option value="">Select\u2026</option>' + finishedProductOptionsPlain(line.productId) + '</select></div>';
     qtyLabel = 'Cartons to dispatch';
     if(line.productId){
-      const bal = finishedStockFor(line.productId).finished;
+      const bal = finishedStockFor(line.productId).finished + dispatchEditReversal(line.productId, 'carton');
       const short = qty > bal;
       balanceHtml = '<div class="balance-hint" style="margin-top:10px;'+(short?'border-color:var(--alert);color:var(--alert);':'')+'">Finished goods: <strong style="margin-left:4px;">'+bal+' cartons</strong>'+(short?' \u2014 not enough stock':'')+'</div>';
     }
@@ -1434,9 +1623,9 @@ function viewDispatchList(){
     }).join('') + '</tbody></table></div>';
 
   const f = App.ui.reportFilter;
-  let dispatches = s.transactions.filter(function(t){return t.type==='dispatch';}).sort(function(a,b){return b.ts-a.ts;});
-  if(f.from) dispatches = dispatches.filter(function(t){return t.ts >= new Date(f.from).getTime();});
-  if(f.to) dispatches = dispatches.filter(function(t){return t.ts <= new Date(f.to).getTime()+86399999;});
+  let dispatches = s.transactions.filter(function(t){return t.type==='dispatch';}).sort(newestFirst);
+  if(f.from) dispatches = dispatches.filter(function(t){return t.ts >= new Date(f.from+'T00:00:00').getTime();});
+  if(f.to) dispatches = dispatches.filter(function(t){return t.ts <= new Date(f.to+'T23:59:59.999').getTime();});
   const live = dispatches.filter(function(t){return !t.voided;});
   const totalCartons = live.filter(function(t){return (t.kind||'carton')==='carton';}).reduce(function(a,t){return a+t.qty;},0);
   const totalLoose = live.filter(function(t){return (t.kind||'carton')==='loose';}).reduce(function(a,t){return a+t.qty;},0);
@@ -1457,11 +1646,11 @@ function viewDispatchList(){
       dispatches.map(function(t){
         const found = findSheetByTxnId(t.id);
         const isLoose = (t.kind||'carton')==='loose';
-        return '<tr><td>'+fmtDate(t.ts)+'</td><td>'+tag(t.challanNo)+(t.voided?' <span class="pill pill-neutral">voided</span>':'')+'</td>' +
+        return '<tr><td>'+fmtDate(t.ts)+'</td><td>'+tag(t.challanNo)+(t.voided?' <span class="pill pill-neutral">voided</span>':'')+(found&&found.sheet.edited?' <span class="pill pill-warn">edited</span>':'')+'</td>' +
           '<td>'+escapeHtml(isLoose?rawMaterialName(t.productId):finishedProductName(t.productId))+(isLoose?' <span class="pill pill-warn">loose</span>':'')+'</td>' +
           '<td class="mono">'+t.qty+' '+(isLoose?'pcs':'ctn')+'</td>' +
           '<td>'+escapeHtml(t.destination||'\u2014')+'</td><td>'+escapeHtml(t.note||'\u2014')+'</td>' +
-          '<td style="white-space:nowrap;">'+(found?'<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchViewSheet(\''+found.sheet.id+'\')">View</button> '+sheetVoidBtn(found.sheet,'dispatchVoidSheet'):'')+'</td></tr>';
+          '<td style="white-space:nowrap;">'+(found?'<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchViewSheet(\''+found.sheet.id+'\')">View</button> '+(t.voided?'':sheetEditBtn(found.sheet,'dispatchEditSheet')+' '+sheetVoidBtn(found.sheet,'dispatchVoidSheet')):'')+'</td></tr>';
       }).join('') + '</tbody></table></div>';
   }
   return html;
@@ -1499,6 +1688,7 @@ function viewDispatchSheetDetail(sheetId){
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
+    (voidable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
     (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.dispatchVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') +
     '</div></div>';
   html += '<div class="card print-sheet">' +
@@ -1506,7 +1696,7 @@ function viewDispatchSheetDetail(sheetId){
     '<div class="eyebrow" style="margin-top:4px;">Dispatch Challan</div></div>' +
     '<div style="margin:16px 0 10px;font-size:13px;">Date: <strong>'+escapeHtml(sh.date)+'</strong> &nbsp;\u00b7&nbsp; Challan: <strong>'+escapeHtml(sh.challanNo)+'</strong>' +
     (sh.destination?' &nbsp;\u00b7&nbsp; To: <strong>'+escapeHtml(sh.destination)+'</strong>':'') +
-    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + '</div>' +
+    (sh.voided?' <span class="pill pill-neutral">VOIDED</span>':'') + (sh.edited?' <span class="pill pill-warn">EDITED</span>':'') + '</div>' +
     '<div class="tbl-wrap"><table><thead><tr><th>S.No</th><th>Product</th><th>Qty</th></tr></thead><tbody>' +
     sh.lines.map(function(l,i){
       const isLoose = (l.kind||'carton')==='loose';
@@ -1516,8 +1706,33 @@ function viewDispatchSheetDetail(sheetId){
     '</div>';
   return html;
 }
+function viewDispatchEditSheet(){
+  const s = App.state;
+  const f = App.ui.dispatchSheetForm;
+  const sh = s.dispatchSheets.find(function(x){return x.id===App.ui.editingDispatchSheetId;});
+  if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  let html = '<div class="section-head"><h2>Edit dispatch \u2014 Challan '+escapeHtml(sh.challanNo)+'</h2>' +
+    '<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchCancelEdit()">Cancel</button></div>';
+  html += '<div class="card" style="margin-bottom:16px;">' +
+    '<div class="field-row">' +
+    '<div class="field"><label>Date</label><input id="dispatchEdit_date" type="date" value="'+escapeHtml(f.date)+'" onchange="App.actions.dispatchSheetSetField(\'date\',this.value)"></div>' +
+    '<div class="field"><label>Destination / buyer (optional)</label><input id="dispatchEdit_destination" value="'+escapeHtml(f.destination)+'" oninput="App.actions.dispatchSheetSetField(\'destination\',this.value)" placeholder="Shop, city, distributor"></div>' +
+    '</div>' +
+    '<div class="field" style="margin-bottom:0;"><label>Note (optional)</label><input id="dispatchEdit_note" value="'+escapeHtml(f.note)+'" oninput="App.actions.dispatchSheetSetField(\'note\',this.value)"></div>' +
+    '</div>';
+  html += '<div class="hint" style="margin:-10px 0 13px;">Editing keeps the same challan number. Stock is recalculated and the change is recorded in the ledger.</div>';
+  html += '<label style="display:block;font-size:12px;font-weight:600;color:var(--ink-soft);margin-bottom:8px;">Line items</label>';
+  html += f.lines.map(function(l,i){return renderDispatchLineRow(l,i);}).join('');
+  html += '<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchAddLine()">+ Add line</button>';
+  const totalCtn = f.lines.reduce(function(a,l){return a+((l.kind||'carton')==='carton'?(Number(l.qty)||0):0);},0);
+  const totalLoosePcs = f.lines.reduce(function(a,l){return a+((l.kind||'carton')==='loose'?(Number(l.qty)||0):0);},0);
+  html += '<div class="preview-box" style="margin-top:16px;">Grand total: <strong>'+totalCtn+'</strong> carton(s)'+(totalLoosePcs>0?' + <strong>'+totalLoosePcs+'</strong> loose piece(s)':'')+' across '+f.lines.length+' line(s)</div>';
+  html += '<button class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;font-size:14px;margin-top:6px;" '+(App.ui.busy?'disabled':'')+' onclick="App.actions.dispatchSubmitEdit()">'+(App.ui.busy?'Saving\u2026':'Save changes')+'</button>';
+  return html;
+}
 function viewDispatch(){
   if(App.ui.dispatchMode==='new') return viewDispatchNewSheet();
+  if(App.ui.dispatchMode==='edit') return viewDispatchEditSheet();
   if(App.ui.dispatchMode==='view') return viewDispatchSheetDetail(App.ui.viewingDispatchSheetId);
   return viewDispatchList();
 }
@@ -1558,16 +1773,74 @@ function ledgerUserOptions(selectedUser){
   users.sort();
   return users.map(function(u){ return '<option value="'+escapeHtml(u)+'"'+(u===selectedUser?' selected':'')+'>'+escapeHtml(u)+'</option>'; }).join('');
 }
+/* Deterministic ledger order: by date (ts). Rows sharing a date are put in the
+   order they were actually written -- via the `seq` stamp on newer rows or, for
+   older rows without one, by following each product/area's balance chain
+   (balanceAfter - delta == previous balance). Without this, same-day rows come
+   back from Firestore in random document-id order and the Balance column
+   looks scrambled. */
+function ledgerOrdered(rows){
+  const byPair = {};
+  rows.forEach(function(r){ const k = r.productId+'|'+r.area; (byPair[k] = byPair[k]||[]).push(r); });
+  const rank = new Map();
+  Object.keys(byPair).forEach(function(k){
+    const list = byPair[k].slice().sort(function(a,b){ return a.ts-b.ts; });
+    let i = 0, cur = 0;
+    while(i < list.length){
+      let j = i; while(j < list.length && list[j].ts === list[i].ts) j++;
+      let grp = list.slice(i, j);
+      if(grp.length > 1){
+        if(grp.every(function(r){return r.seq!=null;})){
+          grp.sort(function(a,b){ return a.seq-b.seq; });
+        } else {
+          // Rebuild the write order by following balanceAfter-delta == previous balance.
+          // A balance can repeat (e.g. an edit returns it to an earlier value), so search for a
+          // path that uses EVERY row (backtracking) instead of taking the first match.
+          const rowsLeft = grp.slice().sort(function(a,b){ return String(a.id) < String(b.id) ? -1 : 1; });
+          const used = rowsLeft.map(function(){return false;}), path = []; let steps = 0;
+          const walk = function(bal){
+            if(path.length === rowsLeft.length) return true;
+            if(++steps > 20000) return false;
+            for(let q=0;q<rowsLeft.length;q++){
+              if(used[q] || rowsLeft[q].balanceAfter - rowsLeft[q].delta !== bal) continue;
+              used[q] = true; path.push(rowsLeft[q]);
+              if(walk(rowsLeft[q].balanceAfter)) return true;
+              path.pop(); used[q] = false;
+            }
+            return false;
+          };
+          grp = walk(cur) ? path : rowsLeft;
+        }
+      }
+      grp.forEach(function(r, n){ rank.set(r, n); });
+      cur = grp[grp.length-1].balanceAfter;
+      i = j;
+    }
+  });
+  const sorted = rows.slice().sort(function(a,b){
+    return (a.ts-b.ts) || (rank.get(a)-rank.get(b)) ||
+      (a.productId<b.productId?-1:a.productId>b.productId?1:0) || (a.area<b.area?-1:a.area>b.area?1:0);
+  });
+  // Balance shown = running total in the DISPLAYED (date) order, over the whole ledger.
+  // Staff often enter Saturday's work on Monday, so write order != date order and the
+  // stored balanceAfter would not add up down the page. (The stored value is kept for audit.)
+  const run = {};
+  return sorted.map(function(r){
+    const k = r.productId+'|'+r.area; run[k] = (run[k]||0) + r.delta;
+    return Object.assign({}, r, {bal: run[k]});
+  });
+}
+const LEDGER_AREA_LABELS = {refill:'Refill', loose:'Loose', finished:'Finished'};
 function filteredLedgerRows(){
   const f = App.ui.ledgerFilter;
   const txnTypeMap = ledgerTxnTypeMap();
-  let rows = App.state.ledger.slice().sort(function(a,b){return a.ts-b.ts;});
+  let rows = ledgerOrdered(App.state.ledger);
   if(f.area !== 'all') rows = rows.filter(function(r){return r.area===f.area;});
   if(f.department !== 'all') rows = rows.filter(function(r){return ledgerRowDepartment(r, txnTypeMap)===f.department;});
   if(f.productId) rows = rows.filter(function(r){return r.productId===f.productId;});
   if(f.user !== 'all') rows = rows.filter(function(r){return r.user===f.user;});
-  if(f.from) rows = rows.filter(function(r){return r.ts >= new Date(f.from).getTime();});
-  if(f.to) rows = rows.filter(function(r){return r.ts <= new Date(f.to).getTime()+86399999;});
+  if(f.from) rows = rows.filter(function(r){return r.ts >= new Date(f.from+'T00:00:00').getTime();});
+  if(f.to) rows = rows.filter(function(r){return r.ts <= new Date(f.to+'T23:59:59.999').getTime();});
   if(f.q){
     const q = f.q.toLowerCase();
     rows = rows.filter(function(r){return (productNameForArea(r.area, r.productId)+' '+r.challanNo+' '+r.reason).toLowerCase().includes(q);});
@@ -1576,15 +1849,16 @@ function filteredLedgerRows(){
 }
 function ledgerTable(rows){
   const txnTypeMap = ledgerTxnTypeMap();
-  return '<div class="tbl-wrap"><table><thead><tr><th>When</th><th>Product</th><th>Department</th><th class="mono" style="text-align:right;">In</th><th class="mono" style="text-align:right;">Out</th><th class="mono" style="text-align:right;">Balance</th><th>Reason</th><th>Challan</th><th>By</th></tr></thead><tbody>' +
+  return '<div class="tbl-wrap"><table><thead><tr><th>When</th><th>Product</th><th>Area</th><th>Department</th><th class="mono" style="text-align:right;">In</th><th class="mono" style="text-align:right;">Out</th><th class="mono" style="text-align:right;">Balance</th><th>Reason</th><th>Challan</th><th>By</th></tr></thead><tbody>' +
     rows.map(function(r){
       const inQty = r.delta>0 ? r.delta : null;
       const outQty = r.delta<0 ? -r.delta : null;
       return '<tr><td>'+fmtDateTime(r.ts)+'</td><td>'+escapeHtml(productNameForArea(r.area, r.productId))+'</td>' +
+        '<td>'+escapeHtml(LEDGER_AREA_LABELS[r.area]||r.area)+'</td>' +
         '<td>'+escapeHtml(LEDGER_DEPARTMENT_LABELS[ledgerRowDepartment(r, txnTypeMap)])+'</td>' +
         '<td class="mono delta-pos" style="text-align:right;">'+(inQty!==null?'+'+inQty:'\u2014')+'</td>' +
         '<td class="mono delta-neg" style="text-align:right;">'+(outQty!==null?'\u2212'+outQty:'\u2014')+'</td>' +
-        '<td class="mono" style="text-align:right;font-weight:600;">'+r.balanceAfter+'</td><td>'+escapeHtml(r.reason)+'</td>' +
+        '<td class="mono" style="text-align:right;font-weight:600;">'+r.bal+'</td><td>'+escapeHtml(r.reason)+'</td>' +
         '<td>'+tag(r.challanNo)+'</td><td>'+escapeHtml(r.user)+'</td></tr>';
     }).join('') + '</tbody></table></div>';
 }
@@ -1814,7 +2088,9 @@ App.actions.deleteUser = async function(id){
 /* ---- raw materials ---- */
 App.actions.addRawMaterial = async function(){
   const name = document.getElementById('newRawName').value.trim();
-  const pcsPerBag = Number(document.getElementById('newRawPcsBag').value) || null;
+  const pcsText = document.getElementById('newRawPcsBag').value;
+  if(!isBlank(pcsText) && !isPosWhole(pcsText)) return toast('Standard PCS/Bag must be a whole number', 'err');
+  const pcsPerBag = isBlank(pcsText) ? null : Number(pcsText);
   if(!name) return toast('Enter a raw material name', 'err');
   try{
     const ref = doc(collection(db,'rawMaterials'));
@@ -1839,7 +2115,8 @@ App.actions.deleteRawMaterial = async function(id){
 App.actions.addFinishedProduct = async function(){
   const name = document.getElementById('newFinName').value.trim();
   const rawMaterialId = document.getElementById('newFinRawId').value;
-  const cartonSize = Number(document.getElementById('newFinCarton').value);
+  const cartonText = document.getElementById('newFinCarton').value;
+  const cartonSize = isPosWhole(cartonText) ? Number(cartonText) : 0;
   if(!name) return toast('Enter a finished product name', 'err');
   if(!rawMaterialId) return toast('Select which raw material this is packed from', 'err');
   if(!cartonSize || cartonSize<1) return toast('Enter a valid carton size (pieces per carton)', 'err');
@@ -1875,6 +2152,7 @@ App.actions.refillLineSetField = function(i, key, val){
   if(key==='productId' && line.mode==='single'){
     const p = App.state.rawMaterials.find(function(x){return x.id===val;});
     if(p && p.pcsPerBag) line.pcsPerBag = String(p.pcsPerBag);
+    if(val==='') line.pcsPerBag = '';
   }
   render();
 };
@@ -1897,7 +2175,8 @@ App.actions.refillSubmitSheet = async function(){
   if(isViewer()) return toast('Viewer accounts cannot enter data', 'err');
   const f = App.ui.refillSheetForm;
   if(!f.date) return toast('Select a date', 'err');
-  const validLines = f.lines.filter(lineValid);
+  const chk = checkRows(f.lines, refillRowState); if(chk.error) return toast(chk.error, 'err');
+  const validLines = chk.valid;
   if(!validLines.length) return toast('Add at least one valid line item', 'err');
 
   const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
@@ -1978,6 +2257,121 @@ App.actions.refillSubmitSheet = async function(){
   }catch(e){
     App.ui.busy = false;
     toast('Failed to save sheet: '+e.message, 'err');
+    render();
+  }
+};
+App.actions.refillEditSheet = function(id){
+  if(!isAdmin()) return toast('Only admins can edit entries', 'err');
+  const sh = App.state.materialInSheets.find(function(x){return x.id===id;});
+  if(!sh) return;
+  if(sh.voided) return toast('Cannot edit a voided sheet', 'err');
+  if(!voidWindowOpen(sh)) return toast('Edit window has passed for this sheet', 'err');
+  if(!sheetEditable('refill', sh)) return;
+  App.ui.editBase = App.ui.editBase || {};
+  App.ui.editBase.refill = {id: id, editedAt: sh.editedAt||0, n: (sh.txnIds||[]).length};
+  App.ui.refillSheetForm = {
+    date: sh.date, sheetTitle: sh.sheetTitle||'', receivedBy: sh.receivedBy||'', verifiedBy: sh.verifiedBy||'',
+    lines: JSON.parse(JSON.stringify(sh.lines))
+  };
+  App.ui.viewingRefillSheetId = id;
+  App.ui.editingRefillSheetId = id;
+  App.ui.tab = 'refill';
+  App.ui.refillMode = 'edit';
+  render();
+};
+App.actions.refillCancelEdit = function(){ App.ui.refillMode = 'view'; render(); };
+App.actions.refillSubmitEdit = async function(){
+  if(App.ui.busy) return;
+  if(!isAdmin()) return toast('Only admins can edit entries', 'err');
+  const f = App.ui.refillSheetForm;
+  const sheetId = App.ui.editingRefillSheetId;
+  if(!f.date) return toast('Select a date', 'err');
+  const chk = checkRows(f.lines, refillRowState); if(chk.error) return toast(chk.error, 'err');
+  const validLines = chk.valid;
+  if(!validLines.length) return toast('Add at least one valid line item', 'err');
+
+  const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
+  const newCredits = [];
+  validLines.forEach(function(line){
+    if(line.mode==='mix'){
+      const qtyA = (Number(line.qtyA)||0) * (Number(line.bags)||0);
+      const qtyB = (Number(line.qtyB)||0) * (Number(line.bags)||0);
+      if(qtyA>0) newCredits.push({productId: line.productId, qty: qtyA, note: 'Mix bag with '+rawMaterialName(line.productIdB)});
+      if(qtyB>0) newCredits.push({productId: line.productIdB, qty: qtyB, note: 'Mix bag with '+rawMaterialName(line.productId)});
+    } else {
+      const qty = (Number(line.pcsPerBag)||0) * (Number(line.bags)||0);
+      newCredits.push({productId: line.productId, qty: qty, note: ''});
+    }
+  });
+
+  const sheetRef = doc(db,'materialInSheets',sheetId);
+  const newTxnRefs = newCredits.map(function(){ return doc(collection(db,'transactions')); });
+
+  App.ui.busy = true;
+  render();
+  try{
+    await runTransaction(db, async function(transaction){
+      const sheetSnap = await transaction.get(sheetRef);
+      if(!sheetSnap.exists()) throw new Error('Sheet not found');
+      const sheet = sheetSnap.data();
+      if(sheet.voided) throw new Error('Cannot edit a voided sheet');
+      if(!voidWindowOpen(sheet)) throw new Error('Edit window has passed for this sheet');
+      if(App.ui.editBase && App.ui.editBase.refill && App.ui.editBase.refill.id===sheetId && ((sheet.editedAt||0)!==App.ui.editBase.refill.editedAt || (sheet.txnIds||[]).length!==App.ui.editBase.refill.n)) throw new Error('This sheet was changed by someone else while you were editing it. Close this screen and open the sheet again to see the latest version.');
+      const challanNo = sheet.challanNo;
+
+      const oldTxnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
+      const oldTxnSnaps = await Promise.all(oldTxnRefs.map(function(ref){ return transaction.get(ref); }));
+
+      const uniqueProductIds = [];
+      oldTxnSnaps.forEach(function(s){ if(s.exists()){ const pid=s.data().productId; if(uniqueProductIds.indexOf(pid)===-1) uniqueProductIds.push(pid); } });
+      newCredits.forEach(function(c){ if(uniqueProductIds.indexOf(c.productId)===-1) uniqueProductIds.push(c.productId); });
+
+      const stockRefs = {}; uniqueProductIds.forEach(function(pid){ stockRefs[pid] = doc(db,'stock',pid); });
+      const stockSnaps = await Promise.all(uniqueProductIds.map(function(pid){ return transaction.get(stockRefs[pid]); }));
+      const stock = {};
+      uniqueProductIds.forEach(function(pid, i){ stock[pid] = Object.assign({refill:0, loose:0}, stockSnaps[i].exists() ? stockSnaps[i].data() : {}); });
+
+      const reason = 'Edited \u2014 Challan '+challanNo;
+      const moves = [];
+
+      // Undo the old (still-active) credits...
+      oldTxnSnaps.forEach(function(s, i){
+        if(!s.exists() || s.data().voided) return;
+        const t = s.data();
+        transaction.update(oldTxnRefs[i], {voided:true});
+        moves.push({bucket: stock[t.productId], field:'refill', delta: -t.qty, productId: t.productId, area:'refill', txnId: oldTxnRefs[i].id, reason: reason});
+      });
+      // ...and apply the new ones.
+      const newTxnIds = [];
+      newCredits.forEach(function(c, i){
+        const txnData = buildTxnData('refill_in', c.productId, challanNo, c.note, ts, {qty: c.qty});
+        transaction.set(newTxnRefs[i], txnData);
+        newTxnIds.push(newTxnRefs[i].id);
+        moves.push({bucket: stock[c.productId], field:'refill', delta: c.qty, productId: c.productId, area:'refill', txnId: newTxnRefs[i].id, reason: 'Refill stock IN (edited)'});
+      });
+      applyEditMoves(transaction, moves, ts, challanNo);
+
+      // Only the FINAL balance must be valid.
+      uniqueProductIds.forEach(function(pid){
+        if(stock[pid].refill < 0) throw new Error('Cannot save \u2014 "'+rawMaterialName(pid)+'" would be short by '+(-stock[pid].refill)+' pcs: stock from this sheet has already been used elsewhere');
+      });
+      uniqueProductIds.forEach(function(pid){ transaction.set(stockRefs[pid], stock[pid]); });
+
+      transaction.update(sheetRef, {
+        date: f.date, sheetTitle: f.sheetTitle||'', receivedBy: f.receivedBy||'', verifiedBy: f.verifiedBy||'',
+        lines: validLines, txnIds: sheet.txnIds.concat(newTxnIds), edited: true, editedAt: Date.now()
+      });
+    });
+
+    App.ui.viewingRefillSheetId = sheetId;
+    App.ui.refillMode = 'view';
+    if(App.ui.editBase) App.ui.editBase.refill = null;
+    App.ui.busy = false;
+    toast('Sheet updated', 'ok');
+    render();
+  }catch(e){
+    App.ui.busy = false;
+    toast(e.message || 'Edit failed', 'err');
     render();
   }
 };
@@ -2069,10 +2463,11 @@ App.actions.adjustSubmit = async function(){
   if(!isAdmin()) return toast('Only admins can adjust stock', 'err');
   const productId = document.getElementById('adjProductId').value;
   const direction = document.getElementById('adjDirection').value;
-  const qtyRaw = Number(document.getElementById('adjQty').value);
+  const qtyText = document.getElementById('adjQty').value;
+  const qtyRaw = isPosWhole(qtyText) ? Number(qtyText) : 0;
   const reason = document.getElementById('adjReason').value.trim();
   if(!productId) return toast('Select a raw material', 'err');
-  if(!qtyRaw || qtyRaw<1) return toast('Enter a valid quantity', 'err');
+  if(!qtyRaw) return toast('Enter a whole number of pieces (no decimals or letters)', 'err');
   if(!reason) return toast('Enter a reason \u2014 required for the record', 'err');
   const delta = direction==='remove' ? -qtyRaw : qtyRaw;
 
@@ -2163,7 +2558,8 @@ App.actions.packSubmitSheet = async function(){
   if(isViewer()) return toast('Viewer accounts cannot enter data', 'err');
   const f = App.ui.packSheetForm;
   if(!f.date) return toast('Select a date', 'err');
-  const validLines = f.lines.filter(function(l){ return l.finishedProductId && Number(l.qty)>0; });
+  const chk = checkRows(f.lines, qtyRowState('finishedProductId')); if(chk.error) return toast(chk.error, 'err');
+  const validLines = chk.valid;
   if(!validLines.length) return toast('Add at least one valid line item', 'err');
 
   const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
@@ -2259,6 +2655,135 @@ App.actions.packSubmitSheet = async function(){
 };
 App.actions.packViewSheet = function(id){ App.ui.tab = 'pack'; App.ui.viewingPackSheetId = id; App.ui.packMode = 'view'; render(); };
 App.actions.packBackToList = function(){ App.ui.packMode = 'list'; render(); };
+App.actions.packEditSheet = function(id){
+  if(!isAdmin()) return toast('Only admins can edit entries', 'err');
+  const sh = App.state.packingSheets.find(function(x){return x.id===id;});
+  if(!sh) return;
+  if(sh.voided) return toast('Cannot edit a voided sheet', 'err');
+  if(!voidWindowOpen(sh)) return toast('Edit window has passed for this sheet', 'err');
+  if(!sheetEditable('pack', sh)) return;
+  App.ui.editBase = App.ui.editBase || {};
+  App.ui.editBase.pack = {id: id, editedAt: sh.editedAt||0, n: (sh.txnIds||[]).length};
+  App.ui.packSheetForm = { date: sh.date, lines: sh.lines.map(function(l){ return {finishedProductId: l.finishedProductId, qty: String(l.qty)}; }) };
+  App.ui.viewingPackSheetId = id;
+  App.ui.editingPackSheetId = id;
+  App.ui.tab = 'pack';
+  App.ui.packMode = 'edit';
+  render();
+};
+App.actions.packCancelEdit = function(){ App.ui.packMode = 'view'; render(); };
+App.actions.packSubmitEdit = async function(){
+  if(App.ui.busy) return;
+  if(!isAdmin()) return toast('Only admins can edit entries', 'err');
+  const f = App.ui.packSheetForm;
+  const sheetId = App.ui.editingPackSheetId;
+  if(!f.date) return toast('Select a date', 'err');
+  const chk = checkRows(f.lines, qtyRowState('finishedProductId')); if(chk.error) return toast(chk.error, 'err');
+  const validLines = chk.valid;
+  if(!validLines.length) return toast('Add at least one valid line item', 'err');
+
+  const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
+  const linesResolved = validLines.map(function(line){
+    const fp = App.state.finishedProducts.find(function(p){return p.id===line.finishedProductId;});
+    return { finishedProductId: line.finishedProductId, rawMaterialId: fp ? fp.rawMaterialId : '', cartonSize: (fp && fp.cartonSize) || 1, qty: Number(line.qty) };
+  });
+
+  const sheetRef = doc(db,'packingSheets',sheetId);
+  const newTxnRefs = linesResolved.map(function(){ return doc(collection(db,'transactions')); });
+
+  App.ui.busy = true;
+  render();
+  try{
+    await runTransaction(db, async function(transaction){
+      const sheetSnap = await transaction.get(sheetRef);
+      if(!sheetSnap.exists()) throw new Error('Sheet not found');
+      const sheet = sheetSnap.data();
+      if(sheet.voided) throw new Error('Cannot edit a voided sheet');
+      if(!voidWindowOpen(sheet)) throw new Error('Edit window has passed for this sheet');
+      if(App.ui.editBase && App.ui.editBase.pack && App.ui.editBase.pack.id===sheetId && ((sheet.editedAt||0)!==App.ui.editBase.pack.editedAt || (sheet.txnIds||[]).length!==App.ui.editBase.pack.n)) throw new Error('This sheet was changed by someone else while you were editing it. Close this screen and open the sheet again to see the latest version.');
+      const challanNo = sheet.challanNo;
+
+      const oldTxnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
+      const oldTxnSnaps = await Promise.all(oldTxnRefs.map(function(ref){ return transaction.get(ref); }));
+
+      const uniqueRawIds = [];
+      const uniqueFinishedIds = [];
+      oldTxnSnaps.forEach(function(s){
+        if(!s.exists()) return;
+        const t = s.data();
+        if(t.rawMaterialId && uniqueRawIds.indexOf(t.rawMaterialId)===-1) uniqueRawIds.push(t.rawMaterialId);
+        if(uniqueFinishedIds.indexOf(t.productId)===-1) uniqueFinishedIds.push(t.productId);
+      });
+      linesResolved.forEach(function(l){
+        if(l.rawMaterialId && uniqueRawIds.indexOf(l.rawMaterialId)===-1) uniqueRawIds.push(l.rawMaterialId);
+        if(uniqueFinishedIds.indexOf(l.finishedProductId)===-1) uniqueFinishedIds.push(l.finishedProductId);
+      });
+
+      const rawStockRefs = {}; uniqueRawIds.forEach(function(id){ rawStockRefs[id] = doc(db,'stock',id); });
+      const finishedStockRefs = {}; uniqueFinishedIds.forEach(function(id){ finishedStockRefs[id] = doc(db,'finishedStock',id); });
+      const rawSnaps = await Promise.all(uniqueRawIds.map(function(id){ return transaction.get(rawStockRefs[id]); }));
+      const finSnaps = await Promise.all(uniqueFinishedIds.map(function(id){ return transaction.get(finishedStockRefs[id]); }));
+      const raw = {}; uniqueRawIds.forEach(function(id, i){ raw[id] = Object.assign({refill:0,loose:0}, rawSnaps[i].exists()?rawSnaps[i].data():{}); });
+      const fin = {}; uniqueFinishedIds.forEach(function(id, i){ fin[id] = Object.assign({finished:0}, finSnaps[i].exists()?finSnaps[i].data():{}); });
+
+      const reason = 'Edited \u2014 Challan '+challanNo;
+      const moves = [];
+
+      // Undo the old (still-active) lines...
+      oldTxnSnaps.forEach(function(s, i){
+        if(!s.exists() || s.data().voided) return;
+        const t = s.data();
+        transaction.update(oldTxnRefs[i], {voided:true});
+        moves.push({bucket: raw[t.rawMaterialId], field:'refill', delta: t.qtyTaken, productId: t.rawMaterialId, area:'refill', txnId: oldTxnRefs[i].id, reason: reason});
+        if(t.cartonsProduced>0) moves.push({bucket: fin[t.productId], field:'finished', delta: -t.cartonsProduced, productId: t.productId, area:'finished', txnId: oldTxnRefs[i].id, reason: reason});
+        if(t.looseProduced>0) moves.push({bucket: raw[t.rawMaterialId], field:'loose', delta: -t.looseProduced, productId: t.rawMaterialId, area:'loose', txnId: oldTxnRefs[i].id, reason: reason});
+      });
+
+      // ...and apply the new lines.
+      const linesOut = [];
+      const newTxnIds = [];
+      for(let i=0;i<linesResolved.length;i++){
+        const line = linesResolved[i];
+        if(!line.rawMaterialId) throw new Error('This finished product has no raw material set \u2014 check Settings');
+        const cartons = Math.floor(line.qty/line.cartonSize);
+        const looseQty = line.qty % line.cartonSize;
+        const txnData = buildTxnData('pack', line.finishedProductId, challanNo, '', ts, {
+          rawMaterialId: line.rawMaterialId, qtyTaken: line.qty, cartonsProduced: cartons, looseProduced: looseQty
+        });
+        transaction.set(newTxnRefs[i], txnData);
+        newTxnIds.push(newTxnRefs[i].id);
+        moves.push({bucket: raw[line.rawMaterialId], field:'refill', delta: -line.qty, productId: line.rawMaterialId, area:'refill', txnId: newTxnRefs[i].id, reason: 'Sent to packing (edited)'});
+        if(cartons>0) moves.push({bucket: fin[line.finishedProductId], field:'finished', delta: cartons, productId: line.finishedProductId, area:'finished', txnId: newTxnRefs[i].id, reason: 'Packed \u2014 complete cartons (edited)'});
+        if(looseQty>0) moves.push({bucket: raw[line.rawMaterialId], field:'loose', delta: looseQty, productId: line.rawMaterialId, area:'loose', txnId: newTxnRefs[i].id, reason: 'Packed \u2014 loose pieces (edited)'});
+        linesOut.push({finishedProductId: line.finishedProductId, rawMaterialId: line.rawMaterialId, qty: line.qty, cartonsProduced: cartons, looseProduced: looseQty});
+      }
+      applyEditMoves(transaction, moves, ts, challanNo);
+
+      // Only the FINAL balances must be valid.
+      uniqueRawIds.forEach(function(id){
+        if(raw[id].refill < 0) throw new Error('Not enough refill stock for '+rawMaterialName(id)+' \u2014 short by '+(-raw[id].refill)+' pcs');
+        if(raw[id].loose < 0) throw new Error('Cannot save \u2014 loose pieces from "'+rawMaterialName(id)+'" were already returned or dispatched (short by '+(-raw[id].loose)+' pcs)');
+      });
+      uniqueFinishedIds.forEach(function(id){
+        if(fin[id].finished < 0) throw new Error('Cannot save \u2014 cartons of "'+finishedProductName(id)+'" were already dispatched (short by '+(-fin[id].finished)+' cartons)');
+      });
+      uniqueRawIds.forEach(function(id){ transaction.set(rawStockRefs[id], raw[id]); });
+      uniqueFinishedIds.forEach(function(id){ transaction.set(finishedStockRefs[id], fin[id]); });
+      transaction.update(sheetRef, { date: f.date, lines: linesOut, txnIds: sheet.txnIds.concat(newTxnIds), edited: true, editedAt: Date.now() });
+    });
+
+    App.ui.viewingPackSheetId = sheetId;
+    App.ui.packMode = 'view';
+    if(App.ui.editBase) App.ui.editBase.pack = null;
+    App.ui.busy = false;
+    toast('Packing sheet updated', 'ok');
+    render();
+  }catch(e){
+    App.ui.busy = false;
+    toast(e.message || 'Edit failed', 'err');
+    render();
+  }
+};
 App.actions.packVoidSheet = async function(sheetId){
   const cached = App.state.packingSheets.find(function(s){return s.id===sheetId;});
   if(!isAdmin()) return toast('Only admins can void entries', 'err');
@@ -2358,7 +2883,8 @@ App.actions.looseSubmitSheet = async function(){
   const f = App.ui.looseSheetForm;
   if(App.ui.busy) return;
   if(!f.date) return toast('Select a date', 'err');
-  const validLines = f.lines.filter(function(l){ return l.productId && Number(l.qty)>0; });
+  const chk = checkRows(f.lines, qtyRowState('productId')); if(chk.error) return toast(chk.error, 'err');
+  const validLines = chk.valid;
   if(!validLines.length) return toast('Add at least one valid line item', 'err');
 
   const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
@@ -2420,6 +2946,109 @@ App.actions.looseSubmitSheet = async function(){
   }catch(e){
     App.ui.busy = false;
     toast(e.message || 'Failed to return loose pieces', 'err');
+    render();
+  }
+};
+App.actions.looseEditSheet = function(id){
+  if(!isAdmin()) return toast('Only admins can edit entries', 'err');
+  const sh = App.state.looseReturnSheets.find(function(x){return x.id===id;});
+  if(!sh) return;
+  if(sh.voided) return toast('Cannot edit a voided sheet', 'err');
+  if(!voidWindowOpen(sh)) return toast('Edit window has passed for this sheet', 'err');
+  if(!sheetEditable('loose', sh)) return;
+  App.ui.editBase = App.ui.editBase || {};
+  App.ui.editBase.loose = {id: id, editedAt: sh.editedAt||0, n: (sh.txnIds||[]).length};
+  App.ui.looseSheetForm = { date: sh.date, lines: sh.lines.map(function(l){ return {productId: l.productId, qty: String(l.qty)}; }) };
+  App.ui.viewingLooseSheetId = id;
+  App.ui.editingLooseSheetId = id;
+  App.ui.tab = 'loose';
+  App.ui.looseMode = 'edit';
+  render();
+};
+App.actions.looseCancelEdit = function(){ App.ui.looseMode = 'view'; render(); };
+App.actions.looseSubmitEdit = async function(){
+  if(App.ui.busy) return;
+  if(!isAdmin()) return toast('Only admins can edit entries', 'err');
+  const f = App.ui.looseSheetForm;
+  const sheetId = App.ui.editingLooseSheetId;
+  if(!f.date) return toast('Select a date', 'err');
+  const chk = checkRows(f.lines, qtyRowState('productId')); if(chk.error) return toast(chk.error, 'err');
+  const validLines = chk.valid;
+  if(!validLines.length) return toast('Add at least one valid line item', 'err');
+
+  const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
+  const sheetRef = doc(db,'looseReturnSheets',sheetId);
+  const newTxnRefs = validLines.map(function(){ return doc(collection(db,'transactions')); });
+
+  App.ui.busy = true;
+  render();
+  try{
+    await runTransaction(db, async function(transaction){
+      const sheetSnap = await transaction.get(sheetRef);
+      if(!sheetSnap.exists()) throw new Error('Sheet not found');
+      const sheet = sheetSnap.data();
+      if(sheet.voided) throw new Error('Cannot edit a voided sheet');
+      if(!voidWindowOpen(sheet)) throw new Error('Edit window has passed for this sheet');
+      if(App.ui.editBase && App.ui.editBase.loose && App.ui.editBase.loose.id===sheetId && ((sheet.editedAt||0)!==App.ui.editBase.loose.editedAt || (sheet.txnIds||[]).length!==App.ui.editBase.loose.n)) throw new Error('This sheet was changed by someone else while you were editing it. Close this screen and open the sheet again to see the latest version.');
+      const challanNo = sheet.challanNo;
+
+      const oldTxnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
+      const oldTxnSnaps = await Promise.all(oldTxnRefs.map(function(ref){ return transaction.get(ref); }));
+
+      const uniqueProductIds = [];
+      oldTxnSnaps.forEach(function(s){ if(s.exists()){ const pid=s.data().productId; if(uniqueProductIds.indexOf(pid)===-1) uniqueProductIds.push(pid); } });
+      validLines.forEach(function(l){ if(uniqueProductIds.indexOf(l.productId)===-1) uniqueProductIds.push(l.productId); });
+
+      const stockRefs = {}; uniqueProductIds.forEach(function(pid){ stockRefs[pid] = doc(db,'stock',pid); });
+      const stockSnaps = await Promise.all(uniqueProductIds.map(function(pid){ return transaction.get(stockRefs[pid]); }));
+      const stock = {};
+      uniqueProductIds.forEach(function(pid, i){ stock[pid] = Object.assign({refill:0, loose:0}, stockSnaps[i].exists() ? stockSnaps[i].data() : {}); });
+
+      const reason = 'Edited \u2014 Challan '+challanNo;
+      const moves = [];
+
+      // Undo the old (still-active) returns...
+      oldTxnSnaps.forEach(function(s, i){
+        if(!s.exists() || s.data().voided) return;
+        const t = s.data();
+        transaction.update(oldTxnRefs[i], {voided:true});
+        moves.push({bucket: stock[t.productId], field:'loose', delta: t.qty, productId: t.productId, area:'loose', txnId: oldTxnRefs[i].id, reason: reason});
+        moves.push({bucket: stock[t.productId], field:'refill', delta: -t.qty, productId: t.productId, area:'refill', txnId: oldTxnRefs[i].id, reason: reason});
+      });
+
+      // ...and apply the new ones.
+      const newTxnIds = [];
+      const linesOut = [];
+      for(let i=0;i<validLines.length;i++){
+        const line = validLines[i];
+        const qty = Number(line.qty);
+        const txnData = buildTxnData('loose_return', line.productId, challanNo, '', ts, {qty: qty});
+        transaction.set(newTxnRefs[i], txnData);
+        newTxnIds.push(newTxnRefs[i].id);
+        moves.push({bucket: stock[line.productId], field:'loose', delta: -qty, productId: line.productId, area:'loose', txnId: newTxnRefs[i].id, reason: 'Returned to refill stock (edited)'});
+        moves.push({bucket: stock[line.productId], field:'refill', delta: qty, productId: line.productId, area:'refill', txnId: newTxnRefs[i].id, reason: 'Received from loose-piece return (edited)'});
+        linesOut.push({productId: line.productId, qty: qty});
+      }
+      applyEditMoves(transaction, moves, ts, challanNo);
+
+      // Only the FINAL balances must be valid.
+      uniqueProductIds.forEach(function(pid){
+        if(stock[pid].loose < 0) throw new Error('Not enough loose pieces for '+rawMaterialName(pid)+' \u2014 short by '+(-stock[pid].loose)+' pcs');
+        if(stock[pid].refill < 0) throw new Error('Cannot save \u2014 refill stock of "'+rawMaterialName(pid)+'" would be short by '+(-stock[pid].refill)+' pcs: it was already used elsewhere');
+      });
+      uniqueProductIds.forEach(function(pid){ transaction.set(stockRefs[pid], stock[pid]); });
+      transaction.update(sheetRef, { date: f.date, lines: linesOut, txnIds: sheet.txnIds.concat(newTxnIds), edited: true, editedAt: Date.now() });
+    });
+
+    App.ui.viewingLooseSheetId = sheetId;
+    App.ui.looseMode = 'view';
+    if(App.ui.editBase) App.ui.editBase.loose = null;
+    App.ui.busy = false;
+    toast('Loose-return sheet updated', 'ok');
+    render();
+  }catch(e){
+    App.ui.busy = false;
+    toast(e.message || 'Edit failed', 'err');
     render();
   }
 };
@@ -2509,7 +3138,8 @@ App.actions.dispatchSubmitSheet = async function(){
   if(isViewer()) return toast('Viewer accounts cannot enter data', 'err');
   const f = App.ui.dispatchSheetForm;
   if(!f.date) return toast('Select a date', 'err');
-  const validLines = f.lines.filter(function(l){ return l.productId && Number(l.qty)>0; })
+  const chk = checkRows(f.lines, qtyRowState('productId')); if(chk.error) return toast(chk.error, 'err');
+  const validLines = chk.valid
     .map(function(l){ return {kind: l.kind||'carton', productId: l.productId, qty: Number(l.qty)}; });
   if(!validLines.length) return toast('Add at least one valid line item', 'err');
 
@@ -2585,6 +3215,130 @@ App.actions.dispatchSubmitSheet = async function(){
   }catch(e){
     App.ui.busy = false;
     toast(e.message || 'Dispatch failed', 'err');
+    render();
+  }
+};
+App.actions.dispatchEditSheet = function(id){
+  if(!isAdmin()) return toast('Only admins can edit entries', 'err');
+  const sh = App.state.dispatchSheets.find(function(x){return x.id===id;});
+  if(!sh) return;
+  if(sh.voided) return toast('Cannot edit a voided sheet', 'err');
+  if(!voidWindowOpen(sh)) return toast('Edit window has passed for this sheet', 'err');
+  if(!sheetEditable('dispatch', sh)) return;
+  App.ui.editBase = App.ui.editBase || {};
+  App.ui.editBase.dispatch = {id: id, editedAt: sh.editedAt||0, n: (sh.txnIds||[]).length};
+  App.ui.dispatchSheetForm = {
+    date: sh.date, destination: sh.destination||'', note: sh.note||'',
+    lines: sh.lines.map(function(l){ return {kind: l.kind||'carton', productId: l.productId, qty: String(l.qty)}; })
+  };
+  App.ui.viewingDispatchSheetId = id;
+  App.ui.editingDispatchSheetId = id;
+  App.ui.tab = 'dispatch';
+  App.ui.dispatchMode = 'edit';
+  render();
+};
+App.actions.dispatchCancelEdit = function(){ App.ui.dispatchMode = 'view'; render(); };
+App.actions.dispatchSubmitEdit = async function(){
+  if(App.ui.busy) return;
+  if(!isAdmin()) return toast('Only admins can edit entries', 'err');
+  const f = App.ui.dispatchSheetForm;
+  const sheetId = App.ui.editingDispatchSheetId;
+  if(!f.date) return toast('Select a date', 'err');
+  const chk = checkRows(f.lines, qtyRowState('productId')); if(chk.error) return toast(chk.error, 'err');
+  const validLines = chk.valid
+    .map(function(l){ return {kind: l.kind||'carton', productId: l.productId, qty: Number(l.qty)}; });
+  if(!validLines.length) return toast('Add at least one valid line item', 'err');
+
+  const ts = new Date(f.date+'T12:00:00').getTime() || Date.now();
+  const sheetRef = doc(db,'dispatchSheets',sheetId);
+  const newTxnRefs = validLines.map(function(){ return doc(collection(db,'transactions')); });
+
+  App.ui.busy = true;
+  render();
+  try{
+    await runTransaction(db, async function(transaction){
+      const sheetSnap = await transaction.get(sheetRef);
+      if(!sheetSnap.exists()) throw new Error('Sheet not found');
+      const sheet = sheetSnap.data();
+      if(sheet.voided) throw new Error('Cannot edit a voided sheet');
+      if(!voidWindowOpen(sheet)) throw new Error('Edit window has passed for this sheet');
+      if(App.ui.editBase && App.ui.editBase.dispatch && App.ui.editBase.dispatch.id===sheetId && ((sheet.editedAt||0)!==App.ui.editBase.dispatch.editedAt || (sheet.txnIds||[]).length!==App.ui.editBase.dispatch.n)) throw new Error('This sheet was changed by someone else while you were editing it. Close this screen and open the sheet again to see the latest version.');
+      const challanNo = sheet.challanNo;
+
+      const oldTxnRefs = sheet.txnIds.map(function(id){ return doc(db,'transactions',id); });
+      const oldTxnSnaps = await Promise.all(oldTxnRefs.map(function(ref){ return transaction.get(ref); }));
+
+      const uniqueFinishedIds = [];
+      const uniqueRawIds = [];
+      oldTxnSnaps.forEach(function(s){
+        if(!s.exists()) return;
+        const t = s.data();
+        if((t.kind||'carton')==='loose'){ if(uniqueRawIds.indexOf(t.productId)===-1) uniqueRawIds.push(t.productId); }
+        else { if(uniqueFinishedIds.indexOf(t.productId)===-1) uniqueFinishedIds.push(t.productId); }
+      });
+      validLines.forEach(function(l){
+        if(l.kind==='loose'){ if(uniqueRawIds.indexOf(l.productId)===-1) uniqueRawIds.push(l.productId); }
+        else { if(uniqueFinishedIds.indexOf(l.productId)===-1) uniqueFinishedIds.push(l.productId); }
+      });
+
+      const finishedStockRefs = {}; uniqueFinishedIds.forEach(function(pid){ finishedStockRefs[pid] = doc(db,'finishedStock',pid); });
+      const rawStockRefs = {}; uniqueRawIds.forEach(function(pid){ rawStockRefs[pid] = doc(db,'stock',pid); });
+      const finSnaps = await Promise.all(uniqueFinishedIds.map(function(pid){ return transaction.get(finishedStockRefs[pid]); }));
+      const rawSnaps = await Promise.all(uniqueRawIds.map(function(pid){ return transaction.get(rawStockRefs[pid]); }));
+      const fin = {}; uniqueFinishedIds.forEach(function(pid, i){ fin[pid] = Object.assign({finished:0}, finSnaps[i].exists()?finSnaps[i].data():{}); });
+      const raw = {}; uniqueRawIds.forEach(function(pid, i){ raw[pid] = Object.assign({refill:0, loose:0}, rawSnaps[i].exists()?rawSnaps[i].data():{}); });
+
+      const reason = 'Edited \u2014 Challan '+challanNo;
+      const moves = [];
+
+      // Undo the old (still-active) lines into the correct bucket...
+      oldTxnSnaps.forEach(function(s, i){
+        if(!s.exists() || s.data().voided) return;
+        const t = s.data();
+        transaction.update(oldTxnRefs[i], {voided:true});
+        if((t.kind||'carton')==='loose') moves.push({bucket: raw[t.productId], field:'loose', delta: t.qty, productId: t.productId, area:'loose', txnId: oldTxnRefs[i].id, reason: reason});
+        else moves.push({bucket: fin[t.productId], field:'finished', delta: t.qty, productId: t.productId, area:'finished', txnId: oldTxnRefs[i].id, reason: reason});
+      });
+
+      // ...and apply the new lines.
+      const newTxnIds = [];
+      const linesOut = [];
+      for(let i=0;i<validLines.length;i++){
+        const line = validLines[i];
+        const qty = line.qty;
+        const txnData = buildTxnData('dispatch', line.productId, challanNo, f.note, ts, {qty: qty, kind: line.kind, destination: f.destination||''});
+        transaction.set(newTxnRefs[i], txnData);
+        newTxnIds.push(newTxnRefs[i].id);
+        if(line.kind==='loose') moves.push({bucket: raw[line.productId], field:'loose', delta: -qty, productId: line.productId, area:'loose', txnId: newTxnRefs[i].id, reason: 'Dispatched \u2014 loose pieces (edited)'});
+        else moves.push({bucket: fin[line.productId], field:'finished', delta: -qty, productId: line.productId, area:'finished', txnId: newTxnRefs[i].id, reason: 'Dispatched (edited)'});
+        linesOut.push({kind: line.kind, productId: line.productId, qty: qty});
+      }
+      applyEditMoves(transaction, moves, ts, challanNo);
+
+      // Only the FINAL balances must be valid.
+      uniqueRawIds.forEach(function(pid){
+        if(raw[pid].loose < 0) throw new Error('Not enough loose pieces for '+rawMaterialName(pid)+' \u2014 short by '+(-raw[pid].loose)+' pcs');
+      });
+      uniqueFinishedIds.forEach(function(pid){
+        if(fin[pid].finished < 0) throw new Error('Not enough finished cartons for '+finishedProductName(pid)+' \u2014 short by '+(-fin[pid].finished)+' cartons');
+      });
+      uniqueFinishedIds.forEach(function(pid){ transaction.set(finishedStockRefs[pid], fin[pid]); });
+      uniqueRawIds.forEach(function(pid){ transaction.set(rawStockRefs[pid], raw[pid]); });
+      transaction.update(sheetRef, {
+        date: f.date, destination: f.destination||'', note: f.note||'',
+        lines: linesOut, txnIds: sheet.txnIds.concat(newTxnIds), edited: true, editedAt: Date.now()
+      });
+    });
+
+    App.ui.viewingDispatchSheetId = sheetId;
+    App.ui.dispatchMode = 'view';
+    if(App.ui.editBase) App.ui.editBase.dispatch = null;
+    App.ui.busy = false;
+    toast('Dispatch sheet updated', 'ok');
+    render();
+  }catch(e){
+    App.ui.busy = false;
+    toast(e.message || 'Edit failed', 'err');
     render();
   }
 };
@@ -2684,10 +3438,10 @@ function downloadBlob(content, mime, filename){
 App.actions.exportLedgerCSV = function(){
   const txnTypeMap = ledgerTxnTypeMap();
   const rows = [['When','Department','Area','Product','In','Out','Balance','Reason','Challan','By']];
-  filteredLedgerRows().slice().sort(function(a,b){return a.ts-b.ts;}).forEach(function(r){
+  filteredLedgerRows().forEach(function(r){
     rows.push([
       fmtDateTime(r.ts), LEDGER_DEPARTMENT_LABELS[ledgerRowDepartment(r, txnTypeMap)], r.area, productNameForArea(r.area, r.productId),
-      r.delta>0?r.delta:'', r.delta<0?-r.delta:'', r.balanceAfter, r.reason, r.challanNo, r.user
+      r.delta>0?r.delta:'', r.delta<0?-r.delta:'', r.bal, r.reason, r.challanNo, r.user
     ]);
   });
   const csv = rows.map(function(r){return r.map(function(c){return '"'+String(c).replace(/"/g,'""')+'"';}).join(',');}).join('\n');
@@ -2695,7 +3449,7 @@ App.actions.exportLedgerCSV = function(){
 };
 App.actions.exportDispatchCSV = function(){
   const rows = [['Date','Challan','Product','Qty','Unit','Destination','Note','Voided']];
-  App.state.transactions.filter(function(t){return t.type==='dispatch';}).sort(function(a,b){return a.ts-b.ts;}).forEach(function(t){
+  App.state.transactions.filter(function(t){return t.type==='dispatch';}).sort(function(a,b){return newestFirst(b,a);}).forEach(function(t){
     const isLoose = (t.kind||'carton')==='loose';
     rows.push([fmtDate(t.ts), t.challanNo, isLoose?rawMaterialName(t.productId):finishedProductName(t.productId), t.qty, isLoose?'loose pcs':'cartons', t.destination||'', t.note||'', t.voided?'Yes':'No']);
   });

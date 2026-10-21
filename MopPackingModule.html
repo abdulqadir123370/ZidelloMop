@@ -1102,7 +1102,7 @@ function sheetEditable(kind, sh){
   return okLines;
 }
 function sheetEditBtn(sh, actionName){
-  if(!isAdmin() || sh.voided || !voidWindowOpen(sh)) return '';
+  if(!isAdmin() || sh.voided) return '';
   return '<button class="btn btn-ghost btn-sm" onclick="App.actions.'+actionName+'(\''+sh.id+'\')">Edit</button>';
 }
 function viewRefillList(){
@@ -1189,12 +1189,13 @@ function viewRefillSheetDetail(sheetId){
   const s = App.state;
   const sh = s.materialInSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  const editable = isAdmin() && !sh.voided;
   const voidable = isAdmin() && !sh.voided && voidWindowOpen(sh);
 
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.refillBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="App.actions.refillPrintSheet()">Print</button>' +
-    (voidable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.refillEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
+    (editable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.refillEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
     (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.refillVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') +
     '</div></div>';
 
@@ -1380,11 +1381,12 @@ function viewPackSheetDetail(sheetId){
   const s = App.state;
   const sh = s.packingSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  const editable = isAdmin() && !sh.voided;
   const voidable = isAdmin() && !sh.voided && voidWindowOpen(sh);
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.packBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
-    (voidable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.packEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
+    (editable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.packEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
     (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.packVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') + '</div></div>';
   html += '<div class="card print-sheet">' +
     '<div style="text-align:center;margin-bottom:4px;"><div class="disp" style="font-size:22px;">'+escapeHtml(s.meta.companyName||'Company')+'</div>' +
@@ -1513,11 +1515,12 @@ function viewLooseSheetDetail(sheetId){
   const s = App.state;
   const sh = s.looseReturnSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  const editable = isAdmin() && !sh.voided;
   const voidable = isAdmin() && !sh.voided && voidWindowOpen(sh);
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.looseBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
-    (voidable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.looseEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
+    (editable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.looseEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
     (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.looseVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') + '</div></div>';
   html += '<div class="card print-sheet">' +
     '<div style="text-align:center;margin-bottom:4px;"><div class="disp" style="font-size:22px;">'+escapeHtml(s.meta.companyName||'Company')+'</div>' +
@@ -1684,11 +1687,12 @@ function viewDispatchSheetDetail(sheetId){
   const s = App.state;
   const sh = s.dispatchSheets.find(function(x){return x.id===sheetId;});
   if(!sh) return emptyState('Sheet not found', 'It may have been removed.', '', '');
+  const editable = isAdmin() && !sh.voided;
   const voidable = isAdmin() && !sh.voided && voidWindowOpen(sh);
   let html = '<div class="section-head no-print"><button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchBackToList()">\u2190 Back</button>' +
     '<div style="display:flex;gap:8px;">' +
     '<button class="btn btn-ghost btn-sm" onclick="window.print()">Print</button>' +
-    (voidable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
+    (editable?'<button class="btn btn-ghost btn-sm" onclick="App.actions.dispatchEditSheet(\''+sh.id+'\')">Edit sheet</button>':'') +
     (voidable?'<button class="btn btn-danger btn-sm" onclick="App.actions.dispatchVoidSheet(\''+sh.id+'\')">Void sheet</button>':'') +
     '</div></div>';
   html += '<div class="card print-sheet">' +
@@ -2265,7 +2269,6 @@ App.actions.refillEditSheet = function(id){
   const sh = App.state.materialInSheets.find(function(x){return x.id===id;});
   if(!sh) return;
   if(sh.voided) return toast('Cannot edit a voided sheet', 'err');
-  if(!voidWindowOpen(sh)) return toast('Edit window has passed for this sheet', 'err');
   if(!sheetEditable('refill', sh)) return;
   App.ui.editBase = App.ui.editBase || {};
   App.ui.editBase.refill = {id: id, editedAt: sh.editedAt||0, n: (sh.txnIds||[]).length};
@@ -2315,7 +2318,6 @@ App.actions.refillSubmitEdit = async function(){
       if(!sheetSnap.exists()) throw new Error('Sheet not found');
       const sheet = sheetSnap.data();
       if(sheet.voided) throw new Error('Cannot edit a voided sheet');
-      if(!voidWindowOpen(sheet)) throw new Error('Edit window has passed for this sheet');
       if(App.ui.editBase && App.ui.editBase.refill && App.ui.editBase.refill.id===sheetId && ((sheet.editedAt||0)!==App.ui.editBase.refill.editedAt || (sheet.txnIds||[]).length!==App.ui.editBase.refill.n)) throw new Error('This sheet was changed by someone else while you were editing it. Close this screen and open the sheet again to see the latest version.');
       const challanNo = sheet.challanNo;
 
@@ -2660,7 +2662,6 @@ App.actions.packEditSheet = function(id){
   const sh = App.state.packingSheets.find(function(x){return x.id===id;});
   if(!sh) return;
   if(sh.voided) return toast('Cannot edit a voided sheet', 'err');
-  if(!voidWindowOpen(sh)) return toast('Edit window has passed for this sheet', 'err');
   if(!sheetEditable('pack', sh)) return;
   App.ui.editBase = App.ui.editBase || {};
   App.ui.editBase.pack = {id: id, editedAt: sh.editedAt||0, n: (sh.txnIds||[]).length};
@@ -2699,7 +2700,6 @@ App.actions.packSubmitEdit = async function(){
       if(!sheetSnap.exists()) throw new Error('Sheet not found');
       const sheet = sheetSnap.data();
       if(sheet.voided) throw new Error('Cannot edit a voided sheet');
-      if(!voidWindowOpen(sheet)) throw new Error('Edit window has passed for this sheet');
       if(App.ui.editBase && App.ui.editBase.pack && App.ui.editBase.pack.id===sheetId && ((sheet.editedAt||0)!==App.ui.editBase.pack.editedAt || (sheet.txnIds||[]).length!==App.ui.editBase.pack.n)) throw new Error('This sheet was changed by someone else while you were editing it. Close this screen and open the sheet again to see the latest version.');
       const challanNo = sheet.challanNo;
 
@@ -2954,7 +2954,6 @@ App.actions.looseEditSheet = function(id){
   const sh = App.state.looseReturnSheets.find(function(x){return x.id===id;});
   if(!sh) return;
   if(sh.voided) return toast('Cannot edit a voided sheet', 'err');
-  if(!voidWindowOpen(sh)) return toast('Edit window has passed for this sheet', 'err');
   if(!sheetEditable('loose', sh)) return;
   App.ui.editBase = App.ui.editBase || {};
   App.ui.editBase.loose = {id: id, editedAt: sh.editedAt||0, n: (sh.txnIds||[]).length};
@@ -2988,7 +2987,6 @@ App.actions.looseSubmitEdit = async function(){
       if(!sheetSnap.exists()) throw new Error('Sheet not found');
       const sheet = sheetSnap.data();
       if(sheet.voided) throw new Error('Cannot edit a voided sheet');
-      if(!voidWindowOpen(sheet)) throw new Error('Edit window has passed for this sheet');
       if(App.ui.editBase && App.ui.editBase.loose && App.ui.editBase.loose.id===sheetId && ((sheet.editedAt||0)!==App.ui.editBase.loose.editedAt || (sheet.txnIds||[]).length!==App.ui.editBase.loose.n)) throw new Error('This sheet was changed by someone else while you were editing it. Close this screen and open the sheet again to see the latest version.');
       const challanNo = sheet.challanNo;
 
@@ -3223,7 +3221,6 @@ App.actions.dispatchEditSheet = function(id){
   const sh = App.state.dispatchSheets.find(function(x){return x.id===id;});
   if(!sh) return;
   if(sh.voided) return toast('Cannot edit a voided sheet', 'err');
-  if(!voidWindowOpen(sh)) return toast('Edit window has passed for this sheet', 'err');
   if(!sheetEditable('dispatch', sh)) return;
   App.ui.editBase = App.ui.editBase || {};
   App.ui.editBase.dispatch = {id: id, editedAt: sh.editedAt||0, n: (sh.txnIds||[]).length};
@@ -3261,7 +3258,6 @@ App.actions.dispatchSubmitEdit = async function(){
       if(!sheetSnap.exists()) throw new Error('Sheet not found');
       const sheet = sheetSnap.data();
       if(sheet.voided) throw new Error('Cannot edit a voided sheet');
-      if(!voidWindowOpen(sheet)) throw new Error('Edit window has passed for this sheet');
       if(App.ui.editBase && App.ui.editBase.dispatch && App.ui.editBase.dispatch.id===sheetId && ((sheet.editedAt||0)!==App.ui.editBase.dispatch.editedAt || (sheet.txnIds||[]).length!==App.ui.editBase.dispatch.n)) throw new Error('This sheet was changed by someone else while you were editing it. Close this screen and open the sheet again to see the latest version.');
       const challanNo = sheet.challanNo;
 
@@ -3460,7 +3456,10 @@ App.actions.exportDispatchCSV = function(){
 /* ---- settings ---- */
 App.actions.setUserName = function(val){ setDoc(doc(db,'meta','settings'), {currentUser: val.trim() || 'Operator'}, {merge:true}).catch(function(e){ toast('Failed to save: '+e.message,'err'); }); };
 App.actions.setCompanyName = function(val){ setDoc(doc(db,'meta','settings'), {companyName: val.trim() || 'Company'}, {merge:true}).catch(function(e){ toast('Failed to save: '+e.message,'err'); }); };
-App.actions.setEditWindow = function(val){ setDoc(doc(db,'meta','settings'), {editWindowHours: Number(val)||24}, {merge:true}).catch(function(e){ toast('Failed to save: '+e.message,'err'); }); };
+App.actions.setEditWindow = function(val){
+  if(!isPosWhole(val)) return toast('Edit/void window must be a whole number of hours (e.g. 24)', 'err');
+  setDoc(doc(db,'meta','settings'), {editWindowHours: Number(val)}, {merge:true}).catch(function(e){ toast('Failed to save: '+e.message,'err'); });
+};
 App.actions.exportJSON = function(){
   downloadBlob(JSON.stringify(App.state, null, 2), 'application/json', 'mop-packing-data.json');
 };
